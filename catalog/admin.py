@@ -1,9 +1,25 @@
 from django.contrib import admin
-from .models import CarMake, CarModel, CarYear, Vehicle, Category, Product
+from .models import (
+    Usuario, Vehiculo, Categoria, Repuesto, CompatibilidadVehicular,
+    ReglaCrossSelling, Carrito, ItemCarrito, TarifaDespacho, Pedido,
+    DetallePedido, TransaccionPago, DocumentoTributario,
+    SolicitudEspecial, SesionChatbot, MensajeChatbot
+)
 
-admin.site.register(CarMake)
-admin.site.register(CarModel)
-admin.site.register(CarYear)
-admin.site.register(Vehicle)
-admin.site.register(Category)
-admin.site.register(Product)
+# Registramos todos los modelos nuevos en el panel de administrador
+admin.site.register(Usuario)
+admin.site.register(Vehiculo)
+admin.site.register(Categoria)
+admin.site.register(Repuesto)
+admin.site.register(CompatibilidadVehicular)
+admin.site.register(ReglaCrossSelling)
+admin.site.register(Carrito)
+admin.site.register(ItemCarrito)
+admin.site.register(TarifaDespacho)
+admin.site.register(Pedido)
+admin.site.register(DetallePedido)
+admin.site.register(TransaccionPago)
+admin.site.register(DocumentoTributario)
+admin.site.register(SolicitudEspecial)
+admin.site.register(SesionChatbot)
+admin.site.register(MensajeChatbot)

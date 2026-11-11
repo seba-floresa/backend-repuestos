@@ -1,49 +1,150 @@
 from django.db import models
+import uuid
 
-# 1. Marcas (Toyota, Kia)
-class CarMake(models.Model):
-    name = models.CharField(max_length=100, unique=True, verbose_name="Marca")
-    def __str__(self): return self.name
+# 1. Usuarios
+class Usuario(models.Model):
+    rut = models.CharField(max_length=12, unique=True)
+    nombre_completo = models.CharField(max_length=120)
+    email = models.EmailField(max_length=150, unique=True)
+    password_hash = models.CharField(max_length=255)
+    telefono = models.CharField(max_length=20, blank=True, null=True)
+    rol = models.CharField(max_length=20)
+    fecha_registro = models.DateTimeField(auto_now_add=True)
 
-# 2. Modelos (Yaris, Rio)
-class CarModel(models.Model):
-    make = models.ForeignKey(CarMake, on_delete=models.CASCADE, verbose_name="Marca")
-    name = models.CharField(max_length=100, verbose_name="Modelo")
-    def __str__(self): return f"{self.make.name} - {self.name}"
+    def __str__(self): return self.nombre_completo
 
-# 3. Años (2018, 2022)
-class CarYear(models.Model):
-    year = models.IntegerField(unique=True, verbose_name="Año")
-    def __str__(self): return str(self.year)
+# 2. Vehículos (Catálogo base para decodificar Patente/VIN)
+class Vehiculo(models.Model):
+    patente = models.CharField(max_length=10, unique=True, blank=True, null=True)
+    vin = models.CharField(max_length=17, unique=True, blank=True, null=True)
+    marca = models.CharField(max_length=50, db_index=True)
+    modelo = models.CharField(max_length=80, db_index=True)
+    anio = models.SmallIntegerField(db_index=True)
+    motorizacion = models.CharField(max_length=50, blank=True, null=True)
 
-# 4. Vehículo Único (Toyota Yaris 2018)
-class Vehicle(models.Model):
-    car_model = models.ForeignKey(CarModel, on_delete=models.CASCADE, verbose_name="Modelo")
-    year = models.ForeignKey(CarYear, on_delete=models.CASCADE, verbose_name="Año")
-    
-    class Meta:
-        verbose_name = "Vehículo"
-        unique_together = ('car_model', 'year') # Evita duplicados
+    def __str__(self): return f"{self.marca} {self.modelo} {self.anio}"
 
-    def __str__(self):
-        return f"{self.car_model.make.name} {self.car_model.name} ({self.year.year})"
+# 3. Categorías de Repuestos
+class Categoria(models.Model):
+    nombre = models.CharField(max_length=80)
+    descripcion = models.TextField(blank=True, null=True)
 
-# 5. Categoría (Filtros, Frenos)
-class Category(models.Model):
-    name = models.CharField(max_length=100)
-    def __str__(self): return self.name
+    def __str__(self): return self.nombre
 
-# 6. PRODUCTO (El Repuesto)
-class Product(models.Model):
-    sku = models.CharField(max_length=50, unique=True, verbose_name="SKU")
-    name = models.CharField(max_length=255, verbose_name="Nombre")
-    price = models.PositiveIntegerField(verbose_name="Precio")
-    stock = models.PositiveIntegerField(default=0)
-    category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True)
-    
-    # LA CLAVE: Relación Muchos a Muchos
-    compatible_vehicles = models.ManyToManyField(Vehicle, blank=True, verbose_name="Autos Compatibles")
-    
-    image = models.ImageField(upload_to='products/', null=True, blank=True, verbose_name="Imagen del Repuesto")
+# 4. Repuestos (Productos)
+class Repuesto(models.Model):
+    categoria = models.ForeignKey(Categoria, on_delete=models.CASCADE)
+    sku = models.CharField(max_length=50, unique=True)
+    nombre = models.CharField(max_length=150)
+    marca_fabricante = models.CharField(max_length=80)
+    precio_unitario = models.IntegerField()
+    peso_kg = models.DecimalField(max_digits=5, decimal_places=2)
+    stock_disponible = models.IntegerField(default=0)
+    stock_reservado = models.IntegerField(default=0)
+    condicion = models.CharField(max_length=20, db_index=True) # NUEVO, USADO, REACONDICIONADO
+    detalle_desgaste = models.TextField(blank=True, null=True)
+    urls_fotos_reales = models.JSONField(blank=True, null=True)
+    activo = models.BooleanField(default=True)
 
-    def __str__(self): return self.name
+    def __str__(self): return self.nombre
+
+# 5. Compatibilidad Vehicular (Tabla intermedia explícita)
+class CompatibilidadVehicular(models.Model):
+    repuesto = models.ForeignKey(Repuesto, on_delete=models.CASCADE)
+    vehiculo = models.ForeignKey(Vehiculo, on_delete=models.CASCADE)
+    anio_desde = models.SmallIntegerField()
+    anio_hasta = models.SmallIntegerField()
+    notas_tecnicas = models.CharField(max_length=255, blank=True, null=True)
+
+# 6. Reglas de Cross-Selling
+class ReglaCrossSelling(models.Model):
+    repuesto_origen = models.ForeignKey(Repuesto, related_name='sugerencias_origen', on_delete=models.CASCADE)
+    repuesto_sugerido = models.ForeignKey(Repuesto, related_name='sugerencias_destino', on_delete=models.CASCADE)
+    tipo_relacion = models.CharField(max_length=50)
+    prioridad = models.SmallIntegerField(default=1)
+
+# 7. Carrito de Compras
+class Carrito(models.Model):
+    usuario = models.OneToOneField(Usuario, on_delete=models.CASCADE)
+    fecha_actualizacion = models.DateTimeField(auto_now=True)
+
+# 8. Items del Carrito
+class ItemCarrito(models.Model):
+    carrito = models.ForeignKey(Carrito, on_delete=models.CASCADE)
+    repuesto = models.ForeignKey(Repuesto, on_delete=models.CASCADE)
+    cantidad = models.SmallIntegerField()
+    precio_capturado = models.IntegerField()
+
+# 9. Tarifas de Despacho
+class TarifaDespacho(models.Model):
+    region = models.CharField(max_length=80)
+    comuna = models.CharField(max_length=80, unique=True)
+    costo_base_kg = models.IntegerField()
+    dias_habiles_estimados = models.SmallIntegerField()
+
+# 10. Pedidos
+class Pedido(models.Model):
+    usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE)
+    tarifa = models.ForeignKey(TarifaDespacho, on_delete=models.SET_NULL, null=True)
+    fecha_creacion = models.DateTimeField(auto_now_add=True)
+    direccion_calle = models.CharField(max_length=255)
+    empresa_courier = models.CharField(max_length=50, blank=True, null=True)
+    codigo_seguimiento = models.CharField(max_length=80, blank=True, null=True)
+    subtotal = models.IntegerField()
+    costo_envio = models.IntegerField()
+    monto_total = models.IntegerField()
+    estado = models.CharField(max_length=30, db_index=True)
+
+# 11. Detalle del Pedido
+class DetallePedido(models.Model):
+    pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE)
+    repuesto = models.ForeignKey(Repuesto, on_delete=models.PROTECT)
+    cantidad = models.SmallIntegerField()
+    precio_historico = models.IntegerField()
+
+# 12. Transacciones de Pago (Webpay)
+class TransaccionPago(models.Model):
+    pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE)
+    token_pasarela = models.CharField(max_length=120, unique=True)
+    codigo_autorizacion = models.CharField(max_length=50, blank=True, null=True)
+    metodo_pago = models.CharField(max_length=30, blank=True, null=True)
+    monto_pagado = models.IntegerField()
+    estado_pago = models.CharField(max_length=20)
+    fecha_transaccion = models.DateTimeField(auto_now_add=True)
+
+# 13. Documentos Tributarios (Boleta/Factura)
+class DocumentoTributario(models.Model):
+    pedido = models.OneToOneField(Pedido, on_delete=models.CASCADE)
+    tipo_documento = models.CharField(max_length=20)
+    folio_sii = models.IntegerField(unique=True, db_index=True)
+    rut_receptor = models.CharField(max_length=12)
+    monto_neto = models.IntegerField()
+    monto_iva = models.IntegerField()
+    monto_total = models.IntegerField()
+    url_pdf_timbrado = models.CharField(max_length=255, blank=True, null=True)
+    fecha_emision = models.DateTimeField(auto_now_add=True)
+
+# 14. Solicitudes Especiales
+class SolicitudEspecial(models.Model):
+    usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE)
+    vin_vehiculo = models.CharField(max_length=17)
+    pieza_requerida = models.CharField(max_length=200)
+    nivel_urgencia = models.CharField(max_length=15)
+    estado = models.CharField(max_length=20, db_index=True)
+    valor_cotizado = models.IntegerField(blank=True, null=True)
+    comentario_admin = models.TextField(blank=True, null=True)
+    fecha_solicitud = models.DateTimeField(auto_now_add=True)
+
+# 15. Sesiones de Chatbot IA
+class SesionChatbot(models.Model):
+    id_sesion = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    usuario = models.ForeignKey(Usuario, on_delete=models.SET_NULL, null=True, blank=True)
+    fecha_inicio = models.DateTimeField(auto_now_add=True)
+    contexto_vehiculo = models.CharField(max_length=100, blank=True, null=True)
+
+# 16. Mensajes del Chatbot
+class MensajeChatbot(models.Model):
+    sesion = models.ForeignKey(SesionChatbot, on_delete=models.CASCADE)
+    emisor = models.CharField(max_length=15)
+    contenido = models.TextField()
+    fecha_envio = models.DateTimeField(auto_now_add=True)

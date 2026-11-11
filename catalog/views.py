@@ -1,34 +1,48 @@
-from rest_framework import generics
-from .models import Product
-from .serializers import ProductSerializer
+from rest_framework import viewsets, status
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAdminUser
 
-class ProductListAPI(generics.ListAPIView):
-    serializer_class = ProductSerializer
+from .models import Repuesto, Categoria, Pedido
+from .serializers import RepuestoSerializer, CategoriaSerializer, PedidoSerializer
+from .services.vin_service import MockBuscadorVehiculo
 
-    def get_queryset(self):
-        """
-        Este método se ejecuta cada vez que alguien llama a la API.
-        Aquí es donde filtramos los repuestos según el auto del cliente.
-        """
-        queryset = Product.objects.all() # Empieza con TODOS los productos
+class CategoriaViewSet(viewsets.ModelViewSet):
+    queryset = Categoria.objects.all()
+    serializer_class = CategoriaSerializer
 
-        # 1. Capturamos lo que viene en la URL (ej: ?make=Toyota&model=Yaris)
-        make_name = self.request.query_params.get('make', None)
-        model_name = self.request.query_params.get('model', None)
-        year_value = self.request.query_params.get('year', None)
+class RepuestoViewSet(viewsets.ModelViewSet):
+    queryset = Repuesto.objects.all()
+    serializer_class = RepuestoSerializer
+    permission_classes = [IsAdminUser] # Exige que la petición HTTP venga de un usuario staff real
 
-        # 2. Si el cliente eligió una Marca, filtramos
-        if make_name:
-            queryset = queryset.filter(compatible_vehicles__car_model__make__name__iexact=make_name)
+class PedidoViewSet(viewsets.ModelViewSet):
+    queryset = Pedido.objects.all()
+    serializer_class = PedidoSerializer
 
-        # 3. Si eligió Modelo, filtramos más
-        if model_name:
-            queryset = queryset.filter(compatible_vehicles__car_model__name__iexact=model_name)
 
-        # 4. Si eligió Año, filtramos aún más
-        if year_value:
-            queryset = queryset.filter(compatible_vehicles__year__year=year_value)
+class BuscarVehiculoAPIView(APIView):
+    """
+    Endpoint para buscar vehículos por Patente o VIN utilizando el Patrón Adaptador.
+    """
+    def get(self, request):
+        # Capturamos el parámetro 'q' de la URL (ej: /api/buscar-vehiculo/?q=ABCD12)
+        identificador = request.query_params.get('q', '').strip()
+        
+        if not identificador:
+            return Response(
+                {"error": "Debe proporcionar una patente o VIN en el parámetro 'q'."}, 
+                status=status.HTTP_400_BAD_REQUEST
+            )
 
-        # El 'distinct()' es clave: evita que salgan duplicados si un repuesto
-        # sirve para varios modelos que coinciden con la búsqueda.
-        return queryset.distinct()
+        # Patrón adaptador instanciado
+        buscador = MockBuscadorVehiculo()
+        resultado = buscador.buscar(identificador)
+
+        if resultado:
+            return Response(resultado, status=status.HTTP_200_OK)
+        else:
+            return Response(
+                {"error": "Vehículo no encontrado en los registros."}, 
+                status=status.HTTP_404_NOT_FOUND
+            )
