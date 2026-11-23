@@ -17,6 +17,7 @@ import math
 import uuid
 from decimal import Decimal
 from django.db import transaction
+import unicodedata
 
 
 import re
@@ -180,7 +181,20 @@ class SoloAdminEscribeMixin:
         return [IsAdminUser()]
 
 
-class CategoriaViewSet(SoloAdminEscribeMixin, viewsets.ModelViewSet):
+def clave_alfabetica(texto):
+    """Clave de orden sin distinguir mayúsculas ni tildes ("Ácido" junto a "acido")."""
+    texto = unicodedata.normalize('NFD', texto or '')
+    return ''.join(c for c in texto if unicodedata.category(c) != 'Mn').casefold()
+
+
+class OrdenAlfabeticoMixin:
+    """Lista ordenada por nombre en Python: SQLite no ordena ignorando tildes."""
+    def list(self, request, *args, **kwargs):
+        objetos = sorted(self.filter_queryset(self.get_queryset()), key=lambda o: clave_alfabetica(o.nombre))
+        return Response(self.get_serializer(objetos, many=True).data)
+
+
+class CategoriaViewSet(OrdenAlfabeticoMixin, SoloAdminEscribeMixin, viewsets.ModelViewSet):
     queryset = Categoria.objects.all().order_by('id')
     serializer_class = CategoriaSerializer
 
@@ -195,7 +209,7 @@ class CategoriaViewSet(SoloAdminEscribeMixin, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
-class SubcategoriaViewSet(SoloAdminEscribeMixin, viewsets.ModelViewSet):
+class SubcategoriaViewSet(OrdenAlfabeticoMixin, SoloAdminEscribeMixin, viewsets.ModelViewSet):
     queryset = Subcategoria.objects.all().order_by('id')
     serializer_class = SubcategoriaSerializer
 
