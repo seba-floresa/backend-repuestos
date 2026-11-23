@@ -29,6 +29,10 @@ class RepuestoSerializer(serializers.ModelSerializer):
     precio = serializers.IntegerField(source='precio_unitario')
     stock = serializers.IntegerField(source='stock_disponible')
 
+    # Si el formulario multipart no envía "activo", DRF lo interpreta como False.
+    # Con default=True los repuestos nuevos quedan visibles en la tienda.
+    activo = serializers.BooleanField(default=True)
+
     # Campos de solo lectura para mostrar nombres y cargar edición en Angular
     categoria_id = serializers.IntegerField(source='categoria.id', read_only=True)
     categoria_nombre = serializers.CharField(source='categoria.nombre', read_only=True)
@@ -46,6 +50,8 @@ class RepuestoSerializer(serializers.ModelSerializer):
             'nombre',
             'marca_fabricante',
             'condicion',
+            'detalle_desgaste',
+            'urls_fotos_reales',
             'peso_kg',
             'categoria',
             'categoria_id',

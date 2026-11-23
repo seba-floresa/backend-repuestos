@@ -116,17 +116,29 @@ class TarifaDespacho(models.Model):
 
 # 12. Pedidos
 class Pedido(models.Model):
-    usuario = models.ForeignKey(Usuario, on_delete=models.CASCADE)
+    # Opcional: un invitado compra sin cuenta
+    usuario = models.ForeignKey(Usuario, on_delete=models.SET_NULL, null=True, blank=True)
     tarifa = models.ForeignKey(TarifaDespacho, on_delete=models.SET_NULL, null=True)
     fecha_creacion = models.DateTimeField(auto_now_add=True)
+
+    # Datos de contacto (el email permite asociar el historial al crear cuenta)
+    email_cliente = models.EmailField(max_length=150, blank=True, default='', db_index=True)
+    nombre_cliente = models.CharField(max_length=80, blank=True, default='')
+    apellido_cliente = models.CharField(max_length=80, blank=True, default='')
+    rut_cliente = models.CharField(max_length=12, blank=True, default='')
+    telefono_cliente = models.CharField(max_length=20, blank=True, default='')
+    patente_vin = models.CharField(max_length=30, blank=True, default='')
+
     direccion_calle = models.CharField(max_length=255)
+    direccion_complemento = models.CharField(max_length=120, blank=True, default='')
+    instrucciones_entrega = models.CharField(max_length=255, blank=True, default='')
+
     empresa_courier = models.CharField(max_length=50, blank=True, null=True)
     codigo_seguimiento = models.CharField(max_length=80, blank=True, null=True)
     subtotal = models.IntegerField()
     costo_envio = models.IntegerField()
     monto_total = models.IntegerField()
     estado = models.CharField(max_length=30, db_index=True)
-
 # 13. Detalle del Pedido
 class DetallePedido(models.Model):
     pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE)
