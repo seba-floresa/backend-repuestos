@@ -7,6 +7,7 @@ from .views import (
     VehiculoViewSet,
     PedidoViewSet,
     BuscarVehiculoAPIView,
+    carga_masiva_repuestos_api_view,
     checkout_api_view,
     login_api_view,
     mi_perfil_api_view,
@@ -25,6 +26,8 @@ router.register(r'repuestos', RepuestoViewSet)
 router.register(r'pedidos', PedidoViewSet)
 
 urlpatterns = [
+    # Antes del router para que no se confunda con repuestos/<id>/
+    path('repuestos/carga-masiva/', carga_masiva_repuestos_api_view, name='api-carga-masiva'),
     # Rutas automáticas del CRUD
     path('', include(router.urls)),
     # Ruta personalizada para la búsqueda de patentes/VIN

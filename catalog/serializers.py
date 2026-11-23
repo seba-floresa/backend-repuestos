@@ -48,6 +48,9 @@ class RepuestoSerializer(serializers.ModelSerializer):
             'sku',
             'codigo_oem',
             'nombre',
+            'descripcion',
+            'intervalo_cambio_km',
+            'intervalo_cambio_meses',
             'marca_fabricante',
             'condicion',
             'detalle_desgaste',
@@ -66,6 +69,8 @@ class RepuestoSerializer(serializers.ModelSerializer):
             'vehiculos',
             'vehiculos_nombres',
         ]
+        # SKU vacío: el modelo genera uno (RS-FIL-0001). Se mantiene la validación de único.
+        extra_kwargs = {'sku': {'required': False, 'allow_blank': True}}
 
     def get_subcategoria_id(self, obj):
         return obj.subcategoria.id if obj.subcategoria else None

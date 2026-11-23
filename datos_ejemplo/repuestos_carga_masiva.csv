@@ -1,0 +1,16 @@
+﻿nombre;marca;categoria;subcategoria;condicion;precio;stock_disponible;codigo_oem;descripcion;intervalo_cambio_km;intervalo_cambio_meses;sku
+Filtro de aceite Toyota Yaris 1.5;Bosch;Filtros;Filtro de Aceite;NUEVO;5990;25;90915-YZZE1;Filtro de aceite de alta eficiencia para motores bencineros.;10000;12;
+Filtro de aceite Hyundai Accent 1.4;Mann-Filter;Filtros;Filtro de Aceite;NUEVO;6490;18;26300-35503;Filtro de aceite con válvula antirretorno.;10000;12;
+Filtro de aceite Chevrolet Sail 1.4;Wega;Filtros;Filtro de Aceite;NUEVO;4990;30;96879797;Filtro de aceite económico de buena retención.;10000;12;
+Filtro de aire Kia Rio 1.4;Mann-Filter;Filtros;Filtro de Aire;NUEVO;9990;15;28113-1R100;Filtro de aire de papel plisado.;20000;12;
+Filtro de aire Nissan Versa 1.6;Bosch;Filtros;Filtro de Aire;NUEVO;10990;12;16546-ED500;Filtro de aire de alto flujo.;20000;12;
+Filtro de polen Suzuki Swift 1.2;Mahle;Filtros;Filtro de Polen;NUEVO;8490;10;95860-62J00;Filtro de cabina con carbón activado.;15000;12;
+Pastillas de freno delanteras Toyota Yaris;Brembo;Sistema de Frenos;Pastillas de Frenos;NUEVO;$24.990;14;04465-0D130;Juego de 4 pastillas cerámicas de bajo ruido.;30000;24;
+Pastillas de freno delanteras Hyundai Accent;Bosch;Sistema de Frenos;Pastillas de Frenos;NUEVO;19990;20;58101-1RA00;Pastillas semimetálicas con indicador de desgaste.;30000;24;
+Pastillas de freno traseras Kia Morning;Frasle;Sistema de Frenos;Pastillas de Frenos;NUEVO;16990;16;58302-07A00;Pastillas traseras para frenos de disco.;40000;24;
+Pastillas de freno delanteras Chevrolet Spark;Jurid;Sistema de Frenos;Pastillas de Frenos;NUEVO;15990;0;96534653;Pastillas orgánicas de uso urbano.;30000;24;
+Pastillas de freno Nissan Tiida (desarme);Genérico;Sistema de Frenos;Pastillas de Frenos;USADO;7990;2;41060-EL00A;Pastillas con 60% de vida útil.;;;
+Bujía iridio Hyundai Accent 1.4;NGK;Encendido;Bujías;NUEVO;8990;40;18846-11070;Bujía de iridio de larga duración.;60000;48;
+Bujía platino Toyota Corolla 1.8;Denso;Encendido;Bujías;NUEVO;7990;32;90919-01253;Bujía de doble platino.;50000;36;
+Bujía cobre Chevrolet Sail 1.4;Bosch;Encendido;Bujías;NUEVO;3490;50;55570241;Bujía estándar de níquel-cobre.;20000;24;
+Bujía iridio Kia Rio 1.6 (SKU manual);NGK;Encendido;Bujías;NUEVO;9490;24;18855-10060;Bujía de iridio con SKU ingresado a mano.;60000;48;RS-ENC-0500

@@ -1,4 +1,5 @@
-from django.db import models
+from django.db import models, transaction, IntegrityError
+import unicodedata
 import uuid
 
 # 1. Usuarios
@@ -63,7 +64,7 @@ class Repuesto(models.Model):
 
     categoria = models.ForeignKey(Categoria, on_delete=models.CASCADE)
     subcategoria = models.ForeignKey(Subcategoria, on_delete=models.SET_NULL, null=True, blank=True)
-    sku = models.CharField(max_length=50, unique=True)
+    sku = models.CharField(max_length=50, unique=True, blank=True)  # vacío = se genera al guardar
     nombre = models.CharField(max_length=150)
     marca_fabricante = models.CharField(max_length=80, default='Genérico')
     precio_unitario = models.IntegerField()
@@ -76,9 +77,47 @@ class Repuesto(models.Model):
     urls_fotos_reales = models.JSONField(blank=True, null=True)
     activo = models.BooleanField(default=True)
     codigo_oem = models.CharField(max_length=50, blank=True, null=True, db_index=True)
+    descripcion = models.TextField(blank=True, null=True)
+    # Cada cuánto se recomienda cambiar la pieza (lo que ocurra primero)
+    intervalo_cambio_km = models.PositiveIntegerField(blank=True, null=True)
+    intervalo_cambio_meses = models.PositiveIntegerField(blank=True, null=True)
 
     def __str__(self):
         return f"{self.sku} - {self.nombre}"
+
+    def save(self, *args, **kwargs):
+        if self.sku:
+            return super().save(*args, **kwargs)
+        # SKU automático. Si otra carga simultánea toma el mismo correlativo,
+        # el índice único lo rechaza y se reintenta con el siguiente.
+        for _ in range(10):
+            self.sku = siguiente_sku(self.categoria)
+            try:
+                with transaction.atomic():
+                    return super().save(*args, **kwargs)
+            except IntegrityError:
+                if not Repuesto.objects.filter(sku=self.sku).exists():
+                    raise  # el error no era por el SKU
+        self.sku = ''
+        raise IntegrityError('No se pudo generar un SKU único. Intenta nuevamente.')
+
+
+def prefijo_categoria(categoria):
+    """3 primeras letras del nombre de la categoría, sin tildes y en mayúsculas ("Filtros" -> "FIL")."""
+    texto = unicodedata.normalize('NFD', categoria.nombre or '')
+    letras = ''.join(c for c in texto if c.isascii() and c.isalpha()).upper()
+    return (letras + 'XXX')[:3]
+
+
+def siguiente_sku(categoria):
+    """RS-<prefijo>-<correlativo de 4 dígitos>, siguiendo al número más alto ya usado con ese prefijo."""
+    prefijo = f'RS-{prefijo_categoria(categoria)}-'
+    numeros = [
+        int(s[len(prefijo):])
+        for s in Repuesto.objects.filter(sku__startswith=prefijo).values_list('sku', flat=True)
+        if s[len(prefijo):].isdigit()
+    ]
+    return f'{prefijo}{max(numeros, default=0) + 1:04d}'
 
 # 7. Compatibilidad Vehicular (Tabla intermedia explícita)
 class CompatibilidadVehicular(models.Model):

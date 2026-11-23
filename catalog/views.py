@@ -13,10 +13,12 @@ from urllib.parse import urlencode
 from django.http import HttpResponseRedirect
 from django.views.decorators.csrf import csrf_exempt
 
+import csv
+import io
 import math
 import uuid
 from decimal import Decimal
-from django.db import transaction
+from django.db import transaction, IntegrityError
 import unicodedata
 
 
@@ -577,3 +579,169 @@ def webpay_retorno_view(request):
         pago.save()
 
     return _volver_al_sitio('ok' if aprobado else 'rechazado', pedido.id, pedido.monto_total)
+
+# --- Carga masiva de repuestos por CSV (solo administradores) ---
+
+COLUMNAS_CSV = [
+    'nombre', 'marca', 'categoria', 'subcategoria', 'condicion', 'precio', 'stock_disponible',
+    'codigo_oem', 'descripcion', 'intervalo_cambio_km', 'intervalo_cambio_meses', 'sku',
+]
+COLUMNAS_OBLIGATORIAS_CSV = set(COLUMNAS_CSV) - {'sku'}
+MAX_BYTES_CSV = 1024 * 1024
+MAX_FILAS_CSV = 2000
+
+
+def _entero_csv(texto, campo, errores, obligatorio=False, minimo=0):
+    """Entero desde el CSV. Acepta "5000", "5.000" y "$5.000". Devuelve None si viene vacío."""
+    texto = (texto or '').strip()
+    if not texto:
+        if obligatorio:
+            errores.append(f'{campo} es obligatorio')
+        return None
+    if not re.fullmatch(r'\$?\s*(\d+|\d{1,3}(\.\d{3})+)', texto):
+        errores.append(f'{campo} debe ser un número entero ("{texto}")')
+        return None
+    valor = int(re.sub(r'\D', '', texto))
+    if valor < minimo:
+        errores.append(f'{campo} debe ser mayor o igual a {minimo}')
+        return None
+    return valor
+
+
+def _validar_fila_csv(fila, categorias, skus_del_archivo):
+    """Devuelve (Repuesto sin guardar, lista de errores) para una fila del CSV."""
+    errores = []
+    dato = lambda k: (fila.get(k) or '').strip()
+
+    nombre = dato('nombre')
+    if not nombre:
+        errores.append('nombre es obligatorio')
+
+    categoria = subcategoria = None
+    cat = categorias.get(clave_alfabetica(dato('categoria')))
+    if not cat:
+        errores.append(f'la categoría "{dato("categoria")}" no existe')
+    else:
+        categoria, subcategorias = cat
+        subcategoria = subcategorias.get(clave_alfabetica(dato('subcategoria')))
+        if not subcategoria:
+            errores.append(f'la subcategoría "{dato("subcategoria")}" no existe en "{categoria.nombre}"')
+
+    condicion = dato('condicion').upper()
+    if condicion not in dict(Repuesto.CONDICION_CHOICES):
+        errores.append(f'condición inválida ("{dato("condicion")}"): usa NUEVO, USADO o REACONDICIONADO')
+
+    precio = _entero_csv(dato('precio'), 'precio', errores, obligatorio=True)
+    stock = _entero_csv(dato('stock_disponible'), 'stock_disponible', errores, obligatorio=True)
+    km = _entero_csv(dato('intervalo_cambio_km'), 'intervalo_cambio_km', errores, minimo=1)
+    meses = _entero_csv(dato('intervalo_cambio_meses'), 'intervalo_cambio_meses', errores, minimo=1)
+
+    sku = dato('sku').upper()
+    if sku:
+        if sku in skus_del_archivo:
+            errores.append(f'el SKU {sku} está repetido en el archivo')
+        skus_del_archivo.add(sku)
+
+    repuesto = Repuesto(
+        nombre=nombre,
+        marca_fabricante=dato('marca') or 'Genérico',
+        categoria=categoria,
+        subcategoria=subcategoria,
+        condicion=condicion,
+        precio_unitario=precio,
+        stock_disponible=stock,
+        codigo_oem=dato('codigo_oem') or None,
+        descripcion=dato('descripcion') or None,
+        intervalo_cambio_km=km,
+        intervalo_cambio_meses=meses,
+        sku=sku,
+    )
+    if not errores:
+        # Largo de textos y SKU ya existente en la base
+        try:
+            repuesto.full_clean(exclude=['sku'] if not sku else [])
+        except ValidationError as e:
+            mensajes = {'sku': 'ya existe un repuesto con ese SKU'}
+            errores += [mensajes.get(campo) or f'{campo}: {" ".join(m)}' for campo, m in e.message_dict.items()]
+    return repuesto, errores
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def carga_masiva_repuestos_api_view(request):
+    """
+    Recibe un CSV (campo "archivo") y un modo: "validar" (no guarda nada) o "importar"
+    (crea en una sola transacción todas las filas válidas). Devuelve el informe por fila.
+    """
+    modo = request.data.get('modo', 'validar')
+    archivo = request.FILES.get('archivo')
+    if modo not in ('validar', 'importar'):
+        return Response({'error': 'El modo debe ser "validar" o "importar".'}, status=status.HTTP_400_BAD_REQUEST)
+    if not archivo:
+        return Response({'error': 'Adjunta un archivo CSV.'}, status=status.HTTP_400_BAD_REQUEST)
+    if archivo.size > MAX_BYTES_CSV:
+        return Response({'error': 'El archivo supera 1 MB.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    contenido = archivo.read()
+    try:
+        texto = contenido.decode('utf-8-sig')
+    except UnicodeDecodeError:
+        texto = contenido.decode('cp1252', errors='replace')  # CSV guardado por Excel en Windows
+
+    # Excel en español separa con punto y coma
+    primera_linea = texto.split('\n', 1)[0]
+    separador = ';' if primera_linea.count(';') > primera_linea.count(',') else ','
+    lector = csv.DictReader(io.StringIO(texto), delimiter=separador)
+    lector.fieldnames = [(c or '').strip().lower() for c in (lector.fieldnames or [])]
+
+    faltantes = [c for c in COLUMNAS_CSV if c in COLUMNAS_OBLIGATORIAS_CSV and c not in lector.fieldnames]
+    if faltantes:
+        return Response({'error': 'Faltan columnas: ' + ', '.join(faltantes)}, status=status.HTTP_400_BAD_REQUEST)
+
+    categorias = {
+        clave_alfabetica(c.nombre): (c, {clave_alfabetica(s.nombre): s for s in c.subcategorias.all()})
+        for c in Categoria.objects.prefetch_related('subcategorias')
+    }
+
+    filas, validos, skus_del_archivo = [], [], set()
+    try:
+        for fila in lector:
+            if not any((v or '').strip() for v in fila.values() if isinstance(v, str)):
+                continue  # línea vacía
+            if len(filas) >= MAX_FILAS_CSV:
+                return Response({'error': f'El archivo supera {MAX_FILAS_CSV} filas.'}, status=status.HTTP_400_BAD_REQUEST)
+            repuesto, errores = _validar_fila_csv(fila, categorias, skus_del_archivo)
+            item = {'fila': lector.line_num, 'nombre': repuesto.nombre, 'sku': repuesto.sku,
+                    'ok': not errores, 'motivo': '; '.join(errores)}
+            filas.append(item)
+            if not errores:
+                validos.append((repuesto, item))
+    except csv.Error as e:
+        return Response({'error': f'El CSV está mal formado: {e}'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not filas:
+        return Response({'error': 'El archivo no tiene filas de datos.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    creadas = 0
+    if modo == 'importar' and validos:
+        try:
+            with transaction.atomic():
+                for repuesto, item in validos:
+                    repuesto.save()  # genera el SKU si viene vacío
+                    item['sku'] = repuesto.sku
+                creadas = len(validos)
+        except IntegrityError:
+            return Response(
+                {'error': 'Otro usuario guardó un repuesto con uno de estos SKU mientras se importaba. '
+                          'No se guardó nada: valida e importa nuevamente.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+    return Response({
+        'modo': modo,
+        'total': len(filas),
+        'validas': len(validos),
+        'con_error': len(filas) - len(validos),
+        'creadas': creadas,
+        'filas': filas,
+    })
