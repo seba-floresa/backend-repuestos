@@ -224,7 +224,7 @@ class ResumenAdminTest(TestCase):
         self.pedido(5000, estado='PENDIENTE_PAGO')
         self.pedido(7000, estado='RECHAZADO', hace_dias=1)
         u = Usuario.objects.create(rut='1-9', nombre_completo='x', email='x@x.cl', password_hash='x', rol='cliente')
-        for estado in ['PENDIENTE', 'RESPONDIDA']:
+        for estado in ['PENDIENTE', 'EN_GESTION', 'COTIZADA', 'RESUELTA', 'NO_DISPONIBLE']:
             SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='x', pieza_requerida='x', nivel_urgencia='x', estado=estado)
 
     def test_solo_administradores(self):
@@ -439,3 +439,76 @@ class ClientesAdminTest(TestCase):
         r = self.client.get('/api/admin/clientes/detalle/?email=ANA@cliente.cl').json()
         self.assertEqual((r['total_gastado'], len(r['pedidos']), r['rut']), (15000, 3, '11111111-1'))
         self.assertEqual(self.client.get('/api/admin/clientes/detalle/?email=nadie@x.cl').status_code, 404)
+
+
+from smtplib import SMTPException
+from unittest import mock
+
+from django.core import mail
+from django.test import TransactionTestCase
+
+
+class CorreoSolicitudTest(TransactionTestCase):
+    """Sin la transacción envolvente de TestCase, para que on_commit corra al guardar como en producción."""
+    def setUp(self):
+        u = Usuario.objects.create(rut='1-9', nombre_completo='Juan Pérez', email='juan@x.cl', password_hash='x', rol='cliente')
+        self.s = SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='VIN1', pieza_requerida='Foco trasero',
+                                                  nivel_urgencia='ALTA', estado='PENDIENTE')
+        self.url = f'/api/admin/solicitudes/{self.s.id}/'
+        self.client.force_login(_admin())
+
+    def patch(self, **datos):
+        return self.client.patch(self.url, datos, content_type='application/json')
+
+    def test_envia_correo_sin_comentario_interno(self):
+        r = self.patch(estado='COTIZADA', valor_cotizado=45000, comentario_admin='Proveedor X cobra 30000',
+                       notificar_cliente=True, mensaje_cliente='  Llega el martes <b>sin falta</b>  ')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual((r.json()['correo_enviado'], r.json()['correo_destino']), (True, 'juan@x.cl'))
+        self.assertEqual(len(mail.outbox), 1)
+        m = mail.outbox[0]
+        self.assertEqual(m.to, ['juan@x.cl'])
+        self.assertEqual(m.subject, f'Tu solicitud #{self.s.id} en RepuestosRS: Cotizada')
+        for texto in ['Foco trasero', 'Estado: Cotizada', '$45.000', 'Llega el martes <b>sin falta</b>']:
+            self.assertIn(texto, m.body)
+        self.assertNotIn('Proveedor X', m.body)
+        self.assertEqual(m.alternatives, [])  # solo texto plano
+        self.s.refresh_from_db()
+        self.assertEqual(self.s.ultimo_mensaje_cliente, 'Llega el martes <b>sin falta</b>')
+        self.assertIsNotNone(self.s.fecha_ultimo_correo)
+        self.assertEqual(r.json()['ultimo_mensaje_cliente'], self.s.ultimo_mensaje_cliente)
+
+    def test_no_envia_si_no_se_pide(self):
+        r = self.patch(estado='NO_DISPONIBLE', mensaje_cliente='no debería salir')
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn('correo_enviado', r.json())
+        self.assertEqual(len(mail.outbox), 0)
+        self.s.refresh_from_db()
+        self.assertEqual((self.s.estado, self.s.fecha_ultimo_correo, self.s.ultimo_mensaje_cliente), ('NO_DISPONIBLE', None, ''))
+
+    def test_si_falla_el_envio_el_cambio_se_guarda(self):
+        with mock.patch('catalog.views.send_mail', side_effect=SMTPException('caído')), \
+                self.assertLogs('catalog.views', 'ERROR'):
+            r = self.patch(estado='RESUELTA', notificar_cliente=True, mensaje_cliente='Hola')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()['correo_enviado'])
+        self.assertIn('SMTPException', r.json()['motivo_correo'])
+        self.s.refresh_from_db()
+        self.assertEqual((self.s.estado, self.s.fecha_ultimo_correo), ('RESUELTA', None))
+
+    def test_valida_largo_del_mensaje(self):
+        r = self.patch(estado='RESUELTA', notificar_cliente=True, mensaje_cliente='x' * 1001)
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('mensaje_cliente', r.json())
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(SolicitudEspecial.objects.get(id=self.s.id).estado, 'PENDIENTE')
+
+    def test_solo_administradores_pueden_notificar(self):
+        self.client.logout()
+        for usuario in [None, User.objects.create_user('cliente', 'c@c.cl', 'x')]:
+            if usuario:
+                self.client.force_login(usuario)
+            r = self.patch(estado='RESUELTA', notificar_cliente=True, mensaje_cliente='Hola')
+            self.assertEqual(r.status_code, 403)
+        self.assertEqual(len(mail.outbox), 0)
+        self.assertEqual(SolicitudEspecial.objects.get(id=self.s.id).estado, 'PENDIENTE')

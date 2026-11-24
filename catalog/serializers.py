@@ -194,14 +194,19 @@ class SolicitudEspecialSerializer(serializers.ModelSerializer):
     cliente_email = serializers.CharField(source='usuario.email', read_only=True)
     cliente_telefono = serializers.CharField(source='usuario.telefono', read_only=True, default='')
     valor_cotizado = serializers.IntegerField(min_value=0, required=False, allow_null=True)
+    # Solo instrucciones para el envío del correo: la vista los saca antes de guardar
+    notificar_cliente = serializers.BooleanField(write_only=True, required=False, default=False)
+    mensaje_cliente = serializers.CharField(write_only=True, required=False, allow_blank=True, max_length=1000,
+                                            error_messages={'max_length': 'El mensaje no puede superar los 1000 caracteres.'})
 
     class Meta:
         model = SolicitudEspecial
         fields = ['id', 'fecha_solicitud', 'cliente_nombre', 'cliente_email', 'cliente_telefono',
                   'vin_vehiculo', 'pieza_requerida', 'nivel_urgencia',
-                  'estado', 'estado_nombre', 'valor_cotizado', 'comentario_admin']
-        # Lo que escribe el cliente no se edita desde el panel
-        read_only_fields = ['vin_vehiculo', 'pieza_requerida', 'nivel_urgencia']
+                  'estado', 'estado_nombre', 'valor_cotizado', 'comentario_admin',
+                  'notificar_cliente', 'mensaje_cliente', 'fecha_ultimo_correo', 'ultimo_mensaje_cliente']
+        # Lo que escribe el cliente no se edita desde el panel; el registro del correo lo escribe el envío
+        read_only_fields = ['vin_vehiculo', 'pieza_requerida', 'nivel_urgencia', 'fecha_ultimo_correo', 'ultimo_mensaje_cliente']
 
 
 class VehiculoSerializer(serializers.ModelSerializer):

@@ -27,6 +27,8 @@ import math
 import uuid
 from decimal import Decimal
 from django.db import transaction, IntegrityError
+from django.core.mail import send_mail
+import logging
 import unicodedata
 
 
@@ -382,6 +384,59 @@ class SolicitudEspecialAdminViewSet(mixins.ListModelMixin, mixins.RetrieveModelM
             qs = qs.filter(Q(usuario__email__icontains=q) | Q(usuario__nombre_completo__icontains=q)
                            | Q(pieza_requerida__icontains=q))
         return qs
+
+    def update(self, request, *args, **kwargs):
+        solicitud = self.get_object()
+        serializer = self.get_serializer(solicitud, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        notificar = serializer.validated_data.pop('notificar_cliente', False)
+        mensaje = serializer.validated_data.pop('mensaje_cliente', '').strip()
+
+        resultado = {}
+        with transaction.atomic():
+            serializer.save()
+            if notificar:
+                # Se envía solo si el cambio quedó guardado; si el envío falla, el cambio se mantiene
+                transaction.on_commit(lambda: resultado.update(notificar_solicitud(solicitud, mensaje)))
+
+        data = self.get_serializer(solicitud).data
+        data.update(resultado)  # el on_commit ya corrió al salir del atomic (autocommit, sin ATOMIC_REQUESTS)
+        return Response(data)
+
+
+logger = logging.getLogger(__name__)
+
+
+def notificar_solicitud(solicitud, mensaje):
+    """Correo de texto plano al cliente. Nunca incluye comentario_admin (es interno)."""
+    destino = solicitud.usuario.email
+    if not destino:
+        return {'correo_enviado': False, 'motivo_correo': 'El cliente no tiene correo registrado.'}
+    estado = solicitud.get_estado_display()
+    lineas = [
+        f'Hola {solicitud.usuario.nombre_completo},',
+        '',
+        f'Tu solicitud #{solicitud.id} cambió de estado.',
+        '',
+        f'Pieza: {solicitud.pieza_requerida}',
+        f'Estado: {estado}',
+    ]
+    if solicitud.valor_cotizado is not None:
+        lineas.append(f'Valor cotizado: ${solicitud.valor_cotizado:,}'.replace(',', '.'))
+    if mensaje:
+        lineas += ['', 'Mensaje de RepuestosRS:', mensaje]
+    lineas += ['', 'Saludos,', 'Equipo RepuestosRS']
+    try:
+        # Texto plano (sin html_message): lo que escribe el administrador no se interpreta como HTML
+        send_mail(f'Tu solicitud #{solicitud.id} en RepuestosRS: {estado}', '\n'.join(lineas), None, [destino])
+    except Exception as e:
+        logger.exception('No se pudo enviar el correo de la solicitud %s', solicitud.id)
+        return {'correo_enviado': False, 'motivo_correo': f'El servidor de correo rechazó el envío ({type(e).__name__}).'}
+
+    ahora = timezone.now()
+    SolicitudEspecial.objects.filter(pk=solicitud.pk).update(fecha_ultimo_correo=ahora, ultimo_mensaje_cliente=mensaje)
+    solicitud.fecha_ultimo_correo, solicitud.ultimo_mensaje_cliente = ahora, mensaje
+    return {'correo_enviado': True, 'correo_destino': destino}
 
 
 @api_view(['GET'])

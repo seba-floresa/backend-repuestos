@@ -247,12 +247,17 @@ class SolicitudEspecial(models.Model):
     ESTADO_CHOICES = [
         ('PENDIENTE', 'Pendiente'),
         ('EN_GESTION', 'En gestión'),
+        ('COTIZADA', 'Cotizada'),
         ('RESUELTA', 'Resuelta'),
+        ('NO_DISPONIBLE', 'No disponible'),
     ]
     estado = models.CharField(max_length=20, db_index=True, choices=ESTADO_CHOICES)
     valor_cotizado = models.IntegerField(blank=True, null=True)
-    comentario_admin = models.TextField(blank=True, null=True)
+    comentario_admin = models.TextField(blank=True, null=True)  # interno: nunca va al cliente
     fecha_solicitud = models.DateTimeField(auto_now_add=True)
+    # Último correo enviado al cliente desde el panel
+    fecha_ultimo_correo = models.DateTimeField(blank=True, null=True)
+    ultimo_mensaje_cliente = models.TextField(blank=True, default='')
 
 # 17. Sesiones de Chatbot IA
 class SesionChatbot(models.Model):

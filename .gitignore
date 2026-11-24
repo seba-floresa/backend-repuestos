@@ -4,3 +4,4 @@ db.sqlite3
 .vscode/
 respaldo_datos.json
 db_respaldo_2026-11-23.sqlite3
+.env
