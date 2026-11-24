@@ -149,6 +149,13 @@ class VehiculoSerializer(serializers.ModelSerializer):
         model = Vehiculo
         fields = ['id', 'marca', 'modelo', 'anio_inicio', 'anio_fin', 'motorizacion', 'nombre']
 
+    def validate(self, data):
+        inicio = data.get('anio_inicio', getattr(self.instance, 'anio_inicio', None))
+        fin = data.get('anio_fin', getattr(self.instance, 'anio_fin', None))
+        if inicio and fin and fin < inicio:
+            raise serializers.ValidationError({'anio_fin': 'El año final no puede ser anterior al año de inicio.'})
+        return data
+
     def get_nombre(self, obj):
         rango = f"{obj.anio_inicio}-{obj.anio_fin}" if obj.anio_fin else f"{obj.anio_inicio}+"
         motor = f"(Motor {obj.motorizacion})" if obj.motorizacion else ""

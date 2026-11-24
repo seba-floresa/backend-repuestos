@@ -1,5 +1,11 @@
 from rest_framework import viewsets, status
+from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
+from datetime import datetime, time, timedelta
+from zoneinfo import ZoneInfo
+from django.db.models import Q, Sum, Count, F, ProtectedError
+from django.db.models.functions import TruncDate
+from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
@@ -229,14 +235,56 @@ class VehiculoViewSet(SoloAdminEscribeMixin, viewsets.ModelViewSet):
     queryset = Vehiculo.objects.all().order_by('marca', 'modelo', 'anio_inicio')
     serializer_class = VehiculoSerializer
 
+class PaginacionOpcional(PageNumberPagination):
+    """Pagina solo si se pide ?page=. Sin él la lista sigue siendo un arreglo (la tienda la usa así)."""
+    page_size = 20
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+    def paginate_queryset(self, queryset, request, view=None):
+        if self.page_query_param not in request.query_params:
+            return None
+        return super().paginate_queryset(queryset, request, view)
+
+
+STOCK_CRITICO = 5
+
+
 class RepuestoViewSet(viewsets.ModelViewSet):
-    queryset = Repuesto.objects.all().order_by('-id')
+    queryset = Repuesto.objects.select_related('categoria', 'subcategoria').order_by('-id')
     serializer_class = RepuestoSerializer
-    
+    pagination_class = PaginacionOpcional
+
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
             return []
         return [IsAdminUser()]
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.action != 'list':
+            return qs
+        p = self.request.query_params
+        q = p.get('q', '').strip()
+        if q:
+            qs = qs.filter(Q(nombre__icontains=q) | Q(sku__icontains=q) | Q(codigo_oem__icontains=q))
+        if p.get('categoria', '').isdigit():
+            qs = qs.filter(categoria_id=p['categoria'])
+        if p.get('condicion'):
+            qs = qs.filter(condicion=p['condicion'].upper())
+        if p.get('stock_critico') in ('1', 'true'):
+            qs = qs.filter(stock_disponible__lte=STOCK_CRITICO)
+        return qs
+
+    def destroy(self, request, *args, **kwargs):
+        # DetallePedido protege los repuestos ya vendidos: se desactivan en vez de borrarse
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {'error': 'No se puede eliminar: el repuesto tiene pedidos asociados. Desactívalo para ocultarlo de la tienda.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
 
 class PedidoViewSet(viewsets.ModelViewSet):
@@ -761,4 +809,76 @@ def carga_masiva_repuestos_api_view(request):
         'con_error': sum(f['estado'] == 'error' for f in filas),
         'creadas': creadas,
         'filas': filas,
+    })
+
+# --- Resumen del panel de administración (solo administradores) ---
+
+ZONA_CHILE = ZoneInfo('America/Santiago')
+# Días hacia atrás desde hoy (incluido). None = desde la primera venta.
+PERIODOS_RESUMEN = {'hoy': 0, '7d': 6, '30d': 29, 'todo': None}
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def resumen_admin_api_view(request):
+    periodo = request.query_params.get('periodo', '7d')
+    if periodo not in PERIODOS_RESUMEN:
+        return Response({'error': 'Período inválido. Usa hoy, 7d, 30d o todo.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    hoy = timezone.localdate(timezone=ZONA_CHILE)
+    pedidos = Pedido.objects.all()
+    dias = PERIODOS_RESUMEN[periodo]
+    if dias is None:
+        primera = pedidos.filter(estado='PAGADO').order_by('fecha_creacion').first()
+        desde = timezone.localdate(primera.fecha_creacion, ZONA_CHILE) if primera else hoy
+    else:
+        desde = hoy - timedelta(days=dias)
+        pedidos = pedidos.filter(fecha_creacion__gte=datetime.combine(desde, time.min, tzinfo=ZONA_CHILE))
+    pagados = pedidos.filter(estado='PAGADO')
+
+    totales = pagados.aggregate(ventas=Sum('monto_total'), cantidad=Count('id'))
+    ventas = totales['ventas'] or 0
+
+    por_dia = {
+        dia: (total, cantidad)
+        for dia, total, cantidad in pagados
+        .annotate(dia=TruncDate('fecha_creacion', tzinfo=ZONA_CHILE))
+        .values('dia').annotate(total=Sum('monto_total'), cantidad=Count('id'))
+        .values_list('dia', 'total', 'cantidad')
+    }
+    ventas_por_dia = []
+    for i in range((hoy - desde).days + 1):
+        dia = desde + timedelta(days=i)
+        total, cantidad = por_dia.get(dia, (0, 0))
+        ventas_por_dia.append({'fecha': dia.isoformat(), 'total': total, 'pedidos': cantidad})
+
+    mas_vendidos = (
+        DetallePedido.objects.filter(pedido__in=pagados)
+        .values('repuesto_id', 'repuesto__sku', 'repuesto__nombre')
+        .annotate(unidades=Sum('cantidad'), total=Sum(F('cantidad') * F('precio_historico')))
+        .order_by('-unidades', '-total')[:5]
+    )
+
+    activos = Repuesto.objects.filter(activo=True)
+    critico = activos.filter(stock_disponible__gt=0, stock_disponible__lte=STOCK_CRITICO).order_by('stock_disponible', 'nombre')
+    agotados = activos.filter(stock_disponible__lte=0).order_by('nombre')
+    campos = ('id', 'sku', 'nombre', 'stock_disponible')
+
+    return Response({
+        'periodo': periodo,
+        'desde': desde.isoformat(),
+        'hasta': hoy.isoformat(),
+        'ventas_totales': ventas,
+        'pedidos_pagados': totales['cantidad'],
+        'ticket_promedio': round(ventas / totales['cantidad']) if totales['cantidad'] else 0,
+        'pedidos_por_estado': dict(pedidos.values_list('estado').annotate(n=Count('id')).order_by()),
+        'ventas_por_dia': ventas_por_dia,
+        'mas_vendidos': [
+            {'id': m['repuesto_id'], 'sku': m['repuesto__sku'], 'nombre': m['repuesto__nombre'],
+             'unidades': m['unidades'], 'total': m['total']}
+            for m in mas_vendidos
+        ],
+        'stock_critico': {'cantidad': critico.count(), 'items': list(critico.values(*campos)[:10])},
+        'agotados': {'cantidad': agotados.count(), 'items': list(agotados.values(*campos)[:10])},
+        'solicitudes_pendientes': SolicitudEspecial.objects.filter(estado='PENDIENTE').count(),
     })

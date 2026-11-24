@@ -16,6 +16,7 @@ from .views import (
     logout_api_view,
     tarifas_despacho_api_view,
     webpay_retorno_view,
+    resumen_admin_api_view,
 )
 
 router = DefaultRouter()
@@ -40,4 +41,5 @@ urlpatterns = [
     path('checkout/', checkout_api_view, name='api-checkout'),
     path('webpay/retorno/', webpay_retorno_view, name='webpay-retorno'),
     path('mi-perfil/', mi_perfil_api_view, name='api-mi-perfil'),
+    path('admin/resumen/', resumen_admin_api_view, name='api-admin-resumen'),
 ]

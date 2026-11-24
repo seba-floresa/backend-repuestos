@@ -133,3 +133,128 @@ class CargaMasivaDuplicadosTest(CargaMasivaTest):
         self.assertEqual([f['estado'] for f in r['filas']], ['duplicada', 'ok', 'duplicada'])
         self.assertEqual((r['duplicadas'], r['creadas']), (2, 1))
         self.assertEqual(Repuesto.objects.filter(nombre__iexact='filtro x').count(), 1)
+
+
+from datetime import timedelta
+
+from django.utils import timezone
+
+from .models import DetallePedido, SolicitudEspecial, Usuario
+
+
+def _admin(nombre='admin'):
+    return User.objects.create_user(nombre, f'{nombre}@a.cl', 'x', is_staff=True)
+
+
+class CatalogoAdminTest(TestCase):
+    def setUp(self):
+        self.filtros = Categoria.objects.create(nombre='Filtros')
+        self.frenos = Categoria.objects.create(nombre='Frenos')
+        for i in range(25):
+            Repuesto.objects.create(categoria=self.filtros, nombre=f'Filtro {i}', precio_unitario=1000, stock_disponible=10)
+        Repuesto.objects.create(categoria=self.frenos, nombre='Pastilla', codigo_oem='OEM-777',
+                                precio_unitario=1, stock_disponible=2, condicion='USADO')
+
+    def test_sin_page_sigue_devolviendo_un_arreglo(self):
+        data = self.client.get('/api/repuestos/').json()
+        self.assertIsInstance(data, list)
+        self.assertEqual(len(data), 26)
+
+    def test_paginado_con_page(self):
+        data = self.client.get('/api/repuestos/?page=2').json()
+        self.assertEqual(data['count'], 26)
+        self.assertEqual(len(data['results']), 6)
+        self.assertEqual(len(self.client.get('/api/repuestos/?page=1&page_size=5').json()['results']), 5)
+
+    def test_busqueda_y_filtros(self):
+        def nombres(qs):
+            return [r['nombre'] for r in self.client.get(f'/api/repuestos/?page=1&{qs}').json()['results']]
+        self.assertEqual(nombres('q=oem-777'), ['Pastilla'])
+        self.assertEqual(nombres('q=RS-FRE'), ['Pastilla'])
+        self.assertEqual(nombres(f'categoria={self.frenos.id}'), ['Pastilla'])
+        self.assertEqual(nombres('condicion=usado'), ['Pastilla'])
+        self.assertEqual(nombres('stock_critico=1'), ['Pastilla'])
+        self.assertEqual(self.client.get('/api/repuestos/?page=1&q=filtro').json()['count'], 25)
+
+    def test_eliminar_repuesto_vendido_responde_400(self):
+        rep = Repuesto.objects.get(nombre='Pastilla')
+        pedido = Pedido.objects.create(direccion_calle='x', subtotal=1, costo_envio=0, monto_total=1, estado='PAGADO')
+        DetallePedido.objects.create(pedido=pedido, repuesto=rep, cantidad=1, precio_historico=1)
+        self.client.force_login(_admin())
+        r = self.client.delete(f'/api/repuestos/{rep.id}/')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Desactívalo', r.json()['error'])
+        r = self.client.patch(f'/api/repuestos/{rep.id}/', {'activo': False}, content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(Repuesto.objects.get(id=rep.id).activo)
+
+
+class VehiculoAdminTest(TestCase):
+    def test_crear_editar_y_validar_anios(self):
+        datos = {'marca': 'Toyota', 'modelo': 'Yaris', 'anio_inicio': 2010, 'anio_fin': 2015}
+        self.assertEqual(self.client.post('/api/vehiculos/', datos, content_type='application/json').status_code, 403)
+        self.client.force_login(_admin())
+        v = self.client.post('/api/vehiculos/', datos, content_type='application/json').json()
+        url = f"/api/vehiculos/{v['id']}/"
+        r = self.client.patch(url, {'motorizacion': '1.5'}, content_type='application/json')
+        self.assertEqual(r.json()['nombre'], 'Toyota Yaris 2010-2015 (Motor 1.5)')
+        r = self.client.patch(url, {'anio_fin': 2005}, content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('anio_fin', r.json())
+
+
+class ResumenAdminTest(TestCase):
+    URL = '/api/admin/resumen/'
+
+    def pedido(self, monto, estado='PAGADO', hace_dias=0):
+        p = Pedido.objects.create(direccion_calle='x', subtotal=monto, costo_envio=0, monto_total=monto, estado=estado)
+        # fecha_creacion es auto_now_add: se ajusta después de crear
+        Pedido.objects.filter(id=p.id).update(fecha_creacion=timezone.now() - timedelta(days=hace_dias))
+        return p
+
+    def setUp(self):
+        cat = Categoria.objects.create(nombre='Filtros')
+        a = Repuesto.objects.create(categoria=cat, nombre='A', precio_unitario=1000, stock_disponible=3)
+        b = Repuesto.objects.create(categoria=cat, nombre='B', precio_unitario=500, stock_disponible=0)
+        Repuesto.objects.create(categoria=cat, nombre='C', precio_unitario=1, stock_disponible=0, activo=False)
+        Repuesto.objects.create(categoria=cat, nombre='D', precio_unitario=1, stock_disponible=50)
+        DetallePedido.objects.create(pedido=self.pedido(3000), repuesto=a, cantidad=3, precio_historico=1000)
+        DetallePedido.objects.create(pedido=self.pedido(1000, hace_dias=3), repuesto=b, cantidad=2, precio_historico=500)
+        DetallePedido.objects.create(pedido=self.pedido(9000, hace_dias=60), repuesto=b, cantidad=10, precio_historico=900)
+        self.pedido(5000, estado='PENDIENTE_PAGO')
+        self.pedido(7000, estado='RECHAZADO', hace_dias=1)
+        u = Usuario.objects.create(rut='1-9', nombre_completo='x', email='x@x.cl', password_hash='x', rol='cliente')
+        for estado in ['PENDIENTE', 'RESPONDIDA']:
+            SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='x', pieza_requerida='x', nivel_urgencia='x', estado=estado)
+
+    def test_solo_administradores(self):
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+        self.client.force_login(User.objects.create_user('cliente', 'c@c.cl', 'x'))
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+    def test_periodo_invalido(self):
+        self.client.force_login(_admin())
+        self.assertEqual(self.client.get(self.URL + '?periodo=90d').status_code, 400)
+
+    def test_indicadores_7d(self):
+        self.client.force_login(_admin())
+        r = self.client.get(self.URL + '?periodo=7d').json()
+        self.assertEqual(r['ventas_totales'], 4000)  # el pedido de hace 60 días queda fuera
+        self.assertEqual(r['ticket_promedio'], 2000)
+        self.assertEqual(r['pedidos_por_estado'], {'PAGADO': 2, 'PENDIENTE_PAGO': 1, 'RECHAZADO': 1})
+        self.assertEqual(len(r['ventas_por_dia']), 7)
+        self.assertEqual(sum(d['total'] for d in r['ventas_por_dia']), 4000)
+        self.assertEqual(r['ventas_por_dia'][-1]['fecha'], r['hasta'])
+        self.assertEqual([m['nombre'] for m in r['mas_vendidos']], ['A', 'B'])
+        self.assertEqual(r['mas_vendidos'][0]['total'], 3000)
+        self.assertEqual([i['nombre'] for i in r['stock_critico']['items']], ['A'])
+        self.assertEqual(r['agotados']['cantidad'], 1)  # C está inactivo
+        self.assertEqual(r['solicitudes_pendientes'], 1)
+
+    def test_hoy_y_todo(self):
+        self.client.force_login(_admin())
+        self.assertEqual(len(self.client.get(self.URL + '?periodo=hoy').json()['ventas_por_dia']), 1)
+        todo = self.client.get(self.URL + '?periodo=todo').json()
+        self.assertEqual(todo['ventas_totales'], 13000)
+        self.assertEqual(todo['mas_vendidos'][0]['nombre'], 'B')
+        self.assertGreaterEqual(len(todo['ventas_por_dia']), 60)
