@@ -11,9 +11,18 @@ from .models import (
 
 
 class CategoriaSerializer(serializers.ModelSerializer):
+    # Acepta "fil" y lo guarda como "FIL"
+    prefijo_sku = serializers.RegexField(
+        r'^[A-Za-z]{3}$', required=False, allow_blank=True,
+        error_messages={'invalid': 'El prefijo debe tener 3 letras (ej: FIL).'},
+    )
+
     class Meta:
         model = Categoria
         fields = '__all__'
+
+    def validate_prefijo_sku(self, valor):
+        return valor.upper()
 
 
 class SubcategoriaSerializer(serializers.ModelSerializer):

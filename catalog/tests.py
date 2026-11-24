@@ -84,3 +84,52 @@ class CargaMasivaTest(TestCase):
         nuevo = Repuesto.objects.get(nombre='Filtro A')
         self.assertEqual((nuevo.sku, nuevo.precio_unitario, nuevo.intervalo_cambio_km), ('RS-FIL-0002', 5990, 10000))
         self.assertEqual(r['filas'][0]['sku'], 'RS-FIL-0002')
+
+from .models import Pedido
+
+
+class PermisosPedidosTest(TestCase):
+    def test_pedidos_solo_para_administradores(self):
+        self.assertEqual(self.client.get('/api/pedidos/').status_code, 403)
+        cliente = User.objects.create_user('cliente', 'c@c.cl', 'x')
+        self.client.force_login(cliente)
+        self.assertEqual(self.client.get('/api/pedidos/').status_code, 403)
+        self.client.force_login(User.objects.create_user('admin', 'a@a.cl', 'x', is_staff=True))
+        self.assertEqual(self.client.get('/api/pedidos/').status_code, 200)
+
+
+class PrefijoSkuTest(TestCase):
+    def test_usa_el_prefijo_de_la_categoria(self):
+        frenos = Categoria.objects.create(nombre='Sistema de Frenos', prefijo_sku='FRE')
+        r = Repuesto.objects.create(categoria=frenos, nombre='a', precio_unitario=1)
+        self.assertEqual(r.sku, 'RS-FRE-0001')
+
+    def test_desarmaduria_usa_des_sin_rs(self):
+        des = Categoria.objects.create(nombre='Desarmaduría', prefijo_sku='DES')
+        Repuesto.objects.create(categoria=des, sku='DES-CAJ-161', nombre='a', precio_unitario=1)  # formato antiguo
+        Repuesto.objects.create(categoria=des, sku='DES-0003', nombre='b', precio_unitario=1)
+        r = Repuesto.objects.create(categoria=des, nombre='c', precio_unitario=1)
+        self.assertEqual(r.sku, 'DES-0004')
+
+    def test_prefijo_editable_por_api(self):
+        cat = Categoria.objects.create(nombre='Suspensión')
+        self.client.force_login(User.objects.create_user('admin', 'a@a.cl', 'x', is_staff=True))
+        url = f'/api/categorias/{cat.id}/'
+        self.assertEqual(self.client.patch(url, {'prefijo_sku': 'sus'}, content_type='application/json').json()['prefijo_sku'], 'SUS')
+        self.assertEqual(self.client.patch(url, {'prefijo_sku': 'S1'}, content_type='application/json').status_code, 400)
+
+
+class CargaMasivaDuplicadosTest(CargaMasivaTest):
+    def test_marca_duplicadas_y_no_las_importa(self):
+        Repuesto.objects.create(categoria=Categoria.objects.get(nombre='Filtros'), sku='RS-FIL-0009',
+                                nombre='Filtro X', marca_fabricante='Bosch', codigo_oem='OEM9', precio_unitario=1)
+        self.client.force_login(self.admin)
+        filas = (
+            'FILTRO X;bosch;Filtros;Filtro de Aceite;NUEVO;1000;1;OEM9;;;;\n'   # ya existe en la base
+            'Filtro Y;Bosch;Filtros;Filtro de Aceite;NUEVO;1000;1;OEM8;;;;\n'
+            'Filtro Y;Bosch;Filtros;Filtro de Aceite;NUEVO;1000;1;OEM8;;;;\n'   # repetida en el archivo
+        )
+        r = self.enviar(filas, 'importar').json()
+        self.assertEqual([f['estado'] for f in r['filas']], ['duplicada', 'ok', 'duplicada'])
+        self.assertEqual((r['duplicadas'], r['creadas']), (2, 1))
+        self.assertEqual(Repuesto.objects.filter(nombre__iexact='filtro x').count(), 1)

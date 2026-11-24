@@ -1,3 +1,4 @@
+from django.core.validators import RegexValidator
 from django.db import models, transaction, IntegrityError
 import unicodedata
 import uuid
@@ -42,6 +43,11 @@ class VehiculoCliente(models.Model):
 class Categoria(models.Model):
     nombre = models.CharField(max_length=80)
     descripcion = models.TextField(blank=True, null=True)
+    # Prefijo del SKU automático (RS-FIL-0001). Vacío = 3 primeras letras del nombre.
+    prefijo_sku = models.CharField(
+        max_length=3, blank=True, default='',
+        validators=[RegexValidator(r'^[A-Z]{3}$', 'El prefijo debe tener 3 letras mayúsculas (ej: FIL).')],
+    )
 
     def __str__(self):
         return self.nombre
@@ -103,15 +109,18 @@ class Repuesto(models.Model):
 
 
 def prefijo_categoria(categoria):
-    """3 primeras letras del nombre de la categoría, sin tildes y en mayúsculas ("Filtros" -> "FIL")."""
+    """Prefijo de la categoría; si no tiene, 3 primeras letras del nombre sin tildes ("Filtros" -> "FIL")."""
+    if categoria.prefijo_sku:
+        return categoria.prefijo_sku
     texto = unicodedata.normalize('NFD', categoria.nombre or '')
     letras = ''.join(c for c in texto if c.isascii() and c.isalpha()).upper()
     return (letras + 'XXX')[:3]
 
 
 def siguiente_sku(categoria):
-    """RS-<prefijo>-<correlativo de 4 dígitos>, siguiendo al número más alto ya usado con ese prefijo."""
-    prefijo = f'RS-{prefijo_categoria(categoria)}-'
+    """RS-<prefijo>-<correlativo de 4 dígitos> (DES-0001 para desarmaduría), tras el número más alto ya usado."""
+    letras = prefijo_categoria(categoria)
+    prefijo = 'DES-' if letras == 'DES' else f'RS-{letras}-'
     numeros = [
         int(s[len(prefijo):])
         for s in Repuesto.objects.filter(sku__startswith=prefijo).values_list('sku', flat=True)

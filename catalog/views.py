@@ -240,8 +240,10 @@ class RepuestoViewSet(viewsets.ModelViewSet):
 
 
 class PedidoViewSet(viewsets.ModelViewSet):
+    # Contiene datos personales (RUT, correo, dirección): solo administradores
     queryset = Pedido.objects.all()
     serializer_class = PedidoSerializer
+    permission_classes = [IsAdminUser]
 
 
 class BuscarVehiculoAPIView(APIView):
@@ -703,6 +705,12 @@ def carga_masiva_repuestos_api_view(request):
         for c in Categoria.objects.prefetch_related('subcategorias')
     }
 
+    # Un repuesto ya existe si coincide nombre, marca y código OEM (sin distinguir mayúsculas ni tildes)
+    clave_repuesto = lambda nombre, marca, oem: (clave_alfabetica(nombre), clave_alfabetica(marca), clave_alfabetica(oem))
+    existentes = {
+        clave_repuesto(*r) for r in Repuesto.objects.values_list('nombre', 'marca_fabricante', 'codigo_oem')
+    }
+
     filas, validos, skus_del_archivo = [], [], set()
     try:
         for fila in lector:
@@ -712,10 +720,18 @@ def carga_masiva_repuestos_api_view(request):
                 return Response({'error': f'El archivo supera {MAX_FILAS_CSV} filas.'}, status=status.HTTP_400_BAD_REQUEST)
             repuesto, errores = _validar_fila_csv(fila, categorias, skus_del_archivo)
             item = {'fila': lector.line_num, 'nombre': repuesto.nombre, 'sku': repuesto.sku,
-                    'ok': not errores, 'motivo': '; '.join(errores)}
+                    'ok': not errores, 'estado': 'ok' if not errores else 'error', 'motivo': '; '.join(errores)}
             filas.append(item)
-            if not errores:
-                validos.append((repuesto, item))
+            if errores:
+                continue
+            clave = clave_repuesto(repuesto.nombre, repuesto.marca_fabricante, repuesto.codigo_oem)
+            if clave in existentes:
+                # Ya está en el catálogo (o más arriba en este mismo archivo): no se importa
+                item.update(ok=False, estado='duplicada',
+                            motivo='ya existe un repuesto con el mismo nombre, marca y código OEM')
+                continue
+            existentes.add(clave)
+            validos.append((repuesto, item))
     except csv.Error as e:
         return Response({'error': f'El CSV está mal formado: {e}'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -741,7 +757,8 @@ def carga_masiva_repuestos_api_view(request):
         'modo': modo,
         'total': len(filas),
         'validas': len(validos),
-        'con_error': len(filas) - len(validos),
+        'duplicadas': sum(f['estado'] == 'duplicada' for f in filas),
+        'con_error': sum(f['estado'] == 'error' for f in filas),
         'creadas': creadas,
         'filas': filas,
     })
