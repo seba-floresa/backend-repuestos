@@ -881,4 +881,6 @@ def resumen_admin_api_view(request):
         'stock_critico': {'cantidad': critico.count(), 'items': list(critico.values(*campos)[:10])},
         'agotados': {'cantidad': agotados.count(), 'items': list(agotados.values(*campos)[:10])},
         'solicitudes_pendientes': SolicitudEspecial.objects.filter(estado='PENDIENTE').count(),
+        # Pagados sin stock suficiente: trabajo pendiente, no depende del período ni suma a las ventas
+        'pedidos_por_revisar': Pedido.objects.filter(estado='REVISAR_STOCK').count(),
     })

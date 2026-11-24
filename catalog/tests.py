@@ -251,6 +251,16 @@ class ResumenAdminTest(TestCase):
         self.assertEqual(r['agotados']['cantidad'], 1)  # C está inactivo
         self.assertEqual(r['solicitudes_pendientes'], 1)
 
+    def test_pedidos_por_revisar_no_suman_a_las_ventas(self):
+        self.pedido(8000, estado='REVISAR_STOCK')
+        self.pedido(6000, estado='REVISAR_STOCK', hace_dias=90)  # fuera del período, igual está pendiente
+        self.client.force_login(_admin())
+        r = self.client.get(self.URL + '?periodo=7d').json()
+        self.assertEqual(r['pedidos_por_revisar'], 2)
+        self.assertEqual(r['ventas_totales'], 4000)
+        self.assertEqual(r['ticket_promedio'], 2000)
+        self.assertEqual(r['pedidos_por_estado']['REVISAR_STOCK'], 1)
+
     def test_hoy_y_todo(self):
         self.client.force_login(_admin())
         self.assertEqual(len(self.client.get(self.URL + '?periodo=hoy').json()['ventas_por_dia']), 1)
