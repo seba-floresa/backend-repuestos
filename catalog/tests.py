@@ -512,3 +512,159 @@ class CorreoSolicitudTest(TransactionTestCase):
             self.assertEqual(r.status_code, 403)
         self.assertEqual(len(mail.outbox), 0)
         self.assertEqual(SolicitudEspecial.objects.get(id=self.s.id).estado, 'PENDIENTE')
+
+
+# --- Tarea D: seguridad para despliegue ---
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from django.test import override_settings
+
+from .models import Vehiculo
+
+
+class PermisosEndpointsTest(TestCase):
+    """Recorre la API como anónimo, cliente y admin."""
+
+    def setUp(self):
+        self.cat = Categoria.objects.create(nombre='Filtros')
+        self.sub = Subcategoria.objects.create(categoria=self.cat, nombre='Aceite')
+        self.rep = Repuesto.objects.create(categoria=self.cat, nombre='Filtro', precio_unitario=5000, stock_disponible=5)
+        self.veh = Vehiculo.objects.create(marca='Toyota', modelo='Hilux')
+        self.tarifa = TarifaDespacho.objects.create(region='RM', comuna='Santiago', costo_base_kg=3000, dias_habiles_estimados=2)
+        self.pedido = _pedido()
+        u = Usuario.objects.create(rut='12345678-5', nombre_completo='Ana', email='ana@cliente.cl', password_hash='x', rol='CLIENTE')
+        self.sol = SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='x', pieza_requerida='x', nivel_urgencia='x', estado='PENDIENTE')
+        self.cliente = User.objects.create_user('cli@c.cl', 'cli@c.cl', 'x')
+
+    def rutas_admin(self):
+        return [
+            ('get', '/api/admin/resumen/'), ('get', '/api/admin/clientes/'),
+            ('get', '/api/admin/clientes/detalle/?email=ana@cliente.cl'),
+            ('get', '/api/admin/solicitudes/'), ('get', f'/api/admin/solicitudes/{self.sol.id}/'),
+            ('patch', f'/api/admin/solicitudes/{self.sol.id}/'),
+            ('get', '/api/pedidos/'), ('get', f'/api/pedidos/{self.pedido.id}/'),
+            ('post', f'/api/pedidos/{self.pedido.id}/avanzar-estado/'),
+            ('post', '/api/repuestos/carga-masiva/'),
+        ]
+
+    def escrituras_catalogo(self):
+        rutas = []
+        for base, obj in [('repuestos', self.rep), ('categorias', self.cat), ('subcategorias', self.sub), ('vehiculos', self.veh)]:
+            rutas += [('post', f'/api/{base}/'), ('put', f'/api/{base}/{obj.id}/'),
+                      ('patch', f'/api/{base}/{obj.id}/'), ('delete', f'/api/{base}/{obj.id}/')]
+        return rutas
+
+    def llamar(self, metodo, url):
+        return getattr(self.client, metodo)(url, {}, content_type='application/json')
+
+    def test_anonimo_y_cliente_no_entran_a_admin_ni_escriben_catalogo(self):
+        for usuario in [None, self.cliente]:
+            if usuario:
+                self.client.force_login(usuario)
+            for metodo, url in self.rutas_admin() + self.escrituras_catalogo():
+                self.assertEqual(self.llamar(metodo, url).status_code, 403, f'{usuario} {metodo} {url}')
+        # Nada cambió
+        self.assertTrue(Repuesto.objects.filter(id=self.rep.id, nombre='Filtro').exists())
+        self.assertEqual(Pedido.objects.get(id=self.pedido.id).estado, 'PAGADO')
+
+    def test_admin_entra_al_panel(self):
+        self.client.force_login(_admin())
+        for metodo, url in self.rutas_admin():
+            if metodo == 'get':
+                self.assertEqual(self.client.get(url).status_code, 200, url)
+        r = self.client.patch(f'/api/repuestos/{self.rep.id}/', {'stock_disponible': 9}, content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+
+    def test_lo_publico_responde_a_anonimos(self):
+        publicas = [
+            '/api/categorias/', f'/api/categorias/{self.cat.id}/',
+            '/api/subcategorias/', f'/api/subcategorias/{self.sub.id}/',
+            '/api/repuestos/', f'/api/repuestos/{self.rep.id}/',
+            '/api/vehiculos/', f'/api/vehiculos/{self.veh.id}/',
+            '/api/tarifas-despacho/', '/api/buscar-vehiculo/?q=ABCD12',
+        ]
+        for url in publicas:
+            self.assertEqual(self.client.get(url).status_code, 200, url)
+        # Compra como invitado: la cotización no exige sesión
+        r = self.client.post('/api/checkout/', {'items': [{'id': self.rep.id, 'cantidad': 1}], 'tarifa_id': self.tarifa.id,
+                                                'simular': True}, content_type='application/json')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['subtotal'], 5000)
+        # El retorno de Webpay es público (redirige al sitio, no responde 403)
+        self.assertEqual(self.client.get('/api/webpay/retorno/').status_code, 302)
+        self.assertEqual(self.client.post('/api/logout/').status_code, 200)
+
+    def test_rutas_de_usuario_piden_sesion(self):
+        for metodo, url in [('get', '/api/mi-perfil/'), ('post', '/api/solicitudes/')]:
+            r = self.llamar(metodo, url)
+            self.assertEqual(r.status_code, 403, url)
+            self.assertIn('iniciar sesión', r.json()['error'])
+
+    def test_register_ignora_rol_e_is_staff(self):
+        r = self.client.post('/api/register/', {
+            'rut': '11111111-1', 'nombre_completo': 'Eva Mala', 'email': 'eva@x.cl', 'password': 'ClaveSegura123',
+            'rol': 'ADMIN', 'is_staff': True, 'is_superuser': True,
+        }, content_type='application/json')
+        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.json()['rol'], 'CLIENTE')
+        self.assertEqual(Usuario.objects.get(email='eva@x.cl').rol, 'CLIENTE')
+        user = User.objects.get(email='eva@x.cl')
+        self.assertFalse(user.is_staff or user.is_superuser)
+        self.client.force_login(user)
+        self.assertEqual(self.client.get('/api/admin/resumen/').status_code, 403)
+
+    def test_login_mismo_mensaje_si_no_existe_o_clave_mala(self):
+        User.objects.create_user('ana@x.cl', 'ana@x.cl', 'buena')
+        login = lambda email, clave: self.client.post('/api/login/', {'email': email, 'password': clave}, content_type='application/json')
+        no_existe, mala = login('nadie@x.cl', 'buena'), login('ana@x.cl', 'mala')
+        self.assertEqual((no_existe.status_code, mala.status_code), (401, 401))
+        self.assertEqual(no_existe.json(), mala.json())
+        self.assertEqual(mala.json()['error'], 'Correo o contraseña incorrectos')
+        self.assertEqual(login('ana@x.cl', 'buena').status_code, 200)
+
+    @override_settings(WEBPAY_COMMERCE_CODE='', WEBPAY_API_KEY='')
+    def test_webpay_sin_credenciales_falla_con_error_claro(self):
+        cliente = {'email': 'a@a.cl', 'nombre': 'Ana', 'apellido': 'Pérez', 'rut': '11111111-1',
+                   'telefono': '12345678', 'direccion': 'Calle 123'}
+        antes = Pedido.objects.count()
+        with mock.patch.object(views.requests, 'post') as post:
+            r = self.client.post('/api/checkout/', {'items': [{'id': self.rep.id, 'cantidad': 1}], 'tarifa_id': self.tarifa.id,
+                                                    'cliente': cliente}, content_type='application/json')
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('Webpay no está configurado', r.json()['error'])
+        post.assert_not_called()
+        self.assertEqual(Pedido.objects.count(), antes)  # el pedido se deshace
+
+
+class SettingsProduccionTest(TestCase):
+    """Carga config/settings.py en un proceso aparte con distintas variables de entorno."""
+    BASE = Path(__file__).resolve().parent.parent
+
+    def cargar(self, **env):
+        # Valores vacíos explícitos: el .env local no los pisa (solo rellena las que faltan)
+        entorno = {**os.environ, 'DJANGO_SECRET_KEY': '', 'WEBPAY_COMMERCE_CODE': '', 'WEBPAY_API_KEY': '',
+                   'DJANGO_ALLOWED_HOSTS': '', 'DJANGO_CSRF_TRUSTED_ORIGINS': '', **env}
+        codigo = ('import config.settings as s; print(s.DEBUG, getattr(s, "SESSION_COOKIE_SECURE", False), '
+                  'getattr(s, "CSRF_COOKIE_SECURE", False), bool(s.WEBPAY_API_KEY), s.ALLOWED_HOSTS, s.CSRF_TRUSTED_ORIGINS)')
+        return subprocess.run([sys.executable, '-c', codigo], cwd=self.BASE, env=entorno, capture_output=True, text=True)
+
+    def test_sin_secret_key_en_produccion_no_arranca(self):
+        r = self.cargar(DJANGO_DEBUG='False')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('DJANGO_SECRET_KEY', r.stderr)
+
+    def test_produccion_cookies_seguras_y_sin_credenciales_de_integracion(self):
+        r = self.cargar(DJANGO_DEBUG='False', DJANGO_SECRET_KEY='k' * 50, DJANGO_ALLOWED_HOSTS='api.x.cl',
+                        DJANGO_CSRF_TRUSTED_ORIGINS='https://x.cl')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "False True True False ['api.x.cl'] ['https://x.cl']")
+
+    def test_desarrollo_funciona_sin_variables(self):
+        r = self.cargar(DJANGO_DEBUG='True')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(),
+                         "True False False True ['localhost', '127.0.0.1'] ['http://localhost:4200']")

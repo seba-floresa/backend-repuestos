@@ -9,10 +9,11 @@ from django.db.models import Q, Sum, Count, F, Max, OuterRef, Subquery, Protecte
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 from rest_framework.response import Response
-from rest_framework.permissions import IsAdminUser
+from django.conf import settings
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import NotAuthenticated
+from rest_framework.permissions import AllowAny, BasePermission, IsAdminUser
 
 
 import os
@@ -54,21 +55,33 @@ from .serializers import (
 from .services.vin_service import MockBuscadorVehiculo
 
 # --- Webpay Plus (ambiente de INTEGRACIÓN por defecto) ---
-# En producción se definen por variables de entorno con las credenciales reales.
+# Las credenciales vienen de settings (variables de entorno); ver WEBPAY_* en config/settings.py.
 WEBPAY_HOST = os.environ.get('WEBPAY_HOST', 'https://webpay3gint.transbank.cl')
 WEBPAY_API = '/rswebpaytransaction/api/webpay/v1.2/transactions'
-WEBPAY_HEADERS = {
-    'Tbk-Api-Key-Id': os.environ.get('WEBPAY_COMMERCE_CODE', '597055555532'),
-    'Tbk-Api-Key-Secret': os.environ.get(
-        'WEBPAY_API_KEY',
-        '579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C',
-    ),
-    'Content-Type': 'application/json',
-}
 BACKEND_URL = os.environ.get('BACKEND_URL', 'http://localhost:8000')
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:4200')
 
 
+def _webpay_headers():
+    """Cabeceras de Transbank, o None si el servidor no tiene credenciales configuradas."""
+    if not settings.WEBPAY_COMMERCE_CODE or not settings.WEBPAY_API_KEY:
+        return None
+    return {
+        'Tbk-Api-Key-Id': settings.WEBPAY_COMMERCE_CODE,
+        'Tbk-Api-Key-Secret': settings.WEBPAY_API_KEY,
+        'Content-Type': 'application/json',
+    }
+
+
+class SesionIniciada(BasePermission):
+    """Usuario autenticado. Responde {"error": ...} en español, como el resto de la API."""
+    def has_permission(self, request, view):
+        if request.user and request.user.is_authenticated:
+            return True
+        raise NotAuthenticated({'error': 'Debes iniciar sesión para continuar.'})
+
+
+LOGIN_INCORRECTO = 'Correo o contraseña incorrectos'
 
 
 @api_view(['POST'])
@@ -82,30 +95,25 @@ def login_api_view(request):
 
     # Buscamos al usuario por su email (Django usa 'username' por defecto, pero mapeamos el email)
     from django.contrib.auth.models import User
-    try:
-        user_obj = User.objects.get(email=email)
-        username = user_obj.username
-    except User.DoesNotExist:
-        return Response({"error": "Credenciales inválidas."}, status=status.HTTP_401_UNAUTHORIZED)
+    user_obj = User.objects.filter(email=email).first()
+    # Mismo mensaje si el correo no existe o la clave es mala: no revela qué correos están registrados
+    user = authenticate(username=user_obj.username, password=password) if user_obj else None
 
-    user = authenticate(username=username, password=password)
+    if user is None:
+        return Response({"error": LOGIN_INCORRECTO}, status=status.HTTP_401_UNAUTHORIZED)
 
-    if user is not None:
-        django_login(request, user)  # crea la sesión para que la API sepa quién eres
+    django_login(request, user)  # crea la sesión para que la API sepa quién eres
 
-    if user is not None:
-        # Si tiene first_name (ej: "Sebastian"), usamos solo el primer nombre; si no, usamos su username (ej: "admin")
-        nombre_corto = user.first_name.split()[0] if user.first_name else user.username
+    # Si tiene first_name (ej: "Sebastian"), usamos solo el primer nombre; si no, usamos su username (ej: "admin")
+    nombre_corto = user.first_name.split()[0] if user.first_name else user.username
 
-        return Response({
-            "mensaje": "Login exitoso",
-            "is_staff": user.is_staff,
-            "username": user.username,
-            "nombre": nombre_corto,
-            "email": user.email
-        }, status=status.HTTP_200_OK)
-    else:
-        return Response({"error": "Contraseña incorrecta."}, status=status.HTTP_401_UNAUTHORIZED)
+    return Response({
+        "mensaje": "Login exitoso",
+        "is_staff": user.is_staff,
+        "username": user.username,
+        "nombre": nombre_corto,
+        "email": user.email
+    }, status=status.HTTP_200_OK)
 
 @api_view(['POST'])
 @permission_classes([AllowAny])
@@ -128,7 +136,8 @@ def register_api_view(request):
     email = request.data.get('email', '').strip()
     password = request.data.get('password')
     telefono = request.data.get('telefono', '').strip()
-    rol = request.data.get('rol', 'CLIENTE')
+    # El registro público siempre crea un cliente: se ignora cualquier "rol" o "is_staff" del cuerpo
+    rol = 'CLIENTE'
 
     if not email or not password or not nombre_completo or not rut:
         return Response(
@@ -173,7 +182,9 @@ def register_api_view(request):
         email=email,
         password=password,
         first_name=first_name,
-        last_name=last_name
+        last_name=last_name,
+        is_staff=False,
+        is_superuser=False,
     )
 
     return Response(
@@ -191,7 +202,7 @@ class SoloAdminEscribeMixin:
     """Lectura pública; crear, editar y eliminar solo para administradores."""
     def get_permissions(self):
         if self.action in ['list', 'retrieve']:
-            return []
+            return [AllowAny()]
         return [IsAdminUser()]
 
 
@@ -256,15 +267,10 @@ class PaginacionOpcional(PageNumberPagination):
 STOCK_CRITICO = 5
 
 
-class RepuestoViewSet(viewsets.ModelViewSet):
+class RepuestoViewSet(SoloAdminEscribeMixin, viewsets.ModelViewSet):
     queryset = Repuesto.objects.select_related('categoria', 'subcategoria').order_by('-id')
     serializer_class = RepuestoSerializer
     pagination_class = PaginacionOpcional
-
-    def get_permissions(self):
-        if self.action in ['list', 'retrieve']:
-            return []
-        return [IsAdminUser()]
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -495,6 +501,8 @@ class BuscarVehiculoAPIView(APIView):
     """
     Endpoint para buscar vehículos por Patente o VIN utilizando el Patrón Adaptador.
     """
+    permission_classes = [AllowAny]
+
     def get(self, request):
         # Capturamos el parámetro 'q' de la URL (ej: /api/buscar-vehiculo/?q=ABCD12)
         identificador = request.query_params.get('q', '').strip()
@@ -519,11 +527,8 @@ class BuscarVehiculoAPIView(APIView):
 
 
 @api_view(['POST'])
-@permission_classes([AllowAny])
+@permission_classes([SesionIniciada])
 def solicitud_repuesto_api_view(request):
-    if not request.user.is_authenticated:
-        return Response({'error': 'Debes iniciar sesión para enviar una solicitud.'}, status=status.HTTP_401_UNAUTHORIZED)
-
     correo = request.user.email or request.user.username
     usuario = Usuario.objects.filter(email__iexact=correo).first()
     if not usuario:
@@ -560,7 +565,7 @@ def _usuario_de_sesion(request):
     return Usuario.objects.filter(email__iexact=correo).first()
 
 @api_view(['GET'])
-@permission_classes([AllowAny])
+@permission_classes([SesionIniciada])
 def mi_perfil_api_view(request):
     """Datos del cliente con sesión iniciada, para autocompletar el checkout."""
     usuario = _usuario_de_sesion(request)
@@ -710,10 +715,14 @@ def checkout_api_view(request):
             # El stock se descuenta cuando Webpay confirma el pago (webpay_retorno_view)
 
             # Pedimos el token a Webpay. Si falla, se deshace el pedido completo.
+            headers = _webpay_headers()
+            if not headers:
+                logger.error('Webpay sin credenciales: define WEBPAY_COMMERCE_CODE y WEBPAY_API_KEY.')
+                raise CheckoutError('El pago con Webpay no está configurado en el servidor. Intenta más tarde o contáctanos.')
             try:
                 resp = requests.post(
                     WEBPAY_HOST + WEBPAY_API,
-                    headers=WEBPAY_HEADERS,
+                    headers=headers,
                     timeout=20,
                     json={
                         'buy_order': f'RS{pedido.id}',
@@ -788,8 +797,12 @@ def webpay_retorno_view(request):
         return _volver_al_sitio('ok' if ok else 'rechazado', pedido.id, pedido.monto_total)
 
     # Confirmar con Webpay
+    headers = _webpay_headers()
+    if not headers:
+        logger.error('Webpay sin credenciales: no se pudo confirmar el pago del pedido %s.', pedido.id)
+        return _volver_al_sitio('error', pedido.id)
     try:
-        r = requests.put(f'{WEBPAY_HOST}{WEBPAY_API}/{token}', headers=WEBPAY_HEADERS, timeout=20)
+        r = requests.put(f'{WEBPAY_HOST}{WEBPAY_API}/{token}', headers=headers, timeout=20)
         r.raise_for_status()
         res = r.json()
     except (requests.RequestException, ValueError):

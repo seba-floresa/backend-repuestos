@@ -17,16 +17,39 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-# Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
+from django.core.exceptions import ImproperlyConfigured
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-s)*dvy)4#ysz3!h5hm^!$%d$qwx7o#9wb!xu7bpa5=)1iwzhjv'
 
-# SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+def _env_bool(nombre, defecto=False):
+    return os.environ.get(nombre, str(defecto)).strip().lower() in ('1', 'true', 'yes')
 
-ALLOWED_HOSTS = []
+
+def _env_lista(nombre):
+    return [v.strip() for v in os.environ.get(nombre, '').split(',') if v.strip()]
+
+
+# Carga .env (si existe) sin pisar variables ya definidas en el sistema. Ver .env.example.
+_ENV_FILE = BASE_DIR / '.env'
+if _ENV_FILE.exists():
+    for _linea in _ENV_FILE.read_text(encoding='utf-8').splitlines():
+        _linea = _linea.strip()
+        if _linea and not _linea.startswith('#') and '=' in _linea:
+            _clave, _valor = _linea.split('=', 1)
+            os.environ.setdefault(_clave.strip(), _valor.strip().strip('"').strip("'"))
+
+
+# --- SEGURIDAD BÁSICA (todo desde variables de entorno) ---
+DEBUG = _env_bool('DJANGO_DEBUG', False)
+
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', '')
+if not SECRET_KEY:
+    if not DEBUG:
+        raise ImproperlyConfigured('Falta la variable de entorno DJANGO_SECRET_KEY (obligatoria con DJANGO_DEBUG=False).')
+    SECRET_KEY = 'django-insecure-solo-desarrollo-local'
+
+ALLOWED_HOSTS = _env_lista('DJANGO_ALLOWED_HOSTS')
+if DEBUG:
+    ALLOWED_HOSTS += ['localhost', '127.0.0.1']
 
 
 # Application definition
@@ -132,18 +155,42 @@ MEDIA_ROOT = BASE_DIR / 'media'
 # 1. Permitir envío de credenciales (cookies de sesión)
 CORS_ALLOW_CREDENTIALS = True
 
-# 2. Orígenes permitidos para peticiones cruzadas
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:4200",
-]
+# 2. Orígenes permitidos para peticiones cruzadas (en DEBUG se agrega el Angular local)
+CORS_ALLOWED_ORIGINS = _env_lista('DJANGO_CORS_ALLOWED_ORIGINS')
 
-# 3. Orígenes de confianza para el token CSRF (¡ESTO RESUELVE EL 403!)
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:4200",
-]
+# 3. Orígenes de confianza para el token CSRF (con esquema: https://tienda.cl)
+CSRF_TRUSTED_ORIGINS = _env_lista('DJANGO_CSRF_TRUSTED_ORIGINS')
+
+if DEBUG:
+    CORS_ALLOWED_ORIGINS += ['http://localhost:4200']
+    CSRF_TRUSTED_ORIGINS += ['http://localhost:4200']
 
 # 4. Permitir que Angular (JavaScript) pueda leer la cookie CSRF
 CSRF_COOKIE_HTTPONLY = False
+
+# 5. Producción (DEBUG=False): cookies solo por HTTPS y el proxy (Nginx, Render, etc.) informa el https.
+#    SameSite=Lax: frontend y API en el mismo sitio (ej: tienda.cl y api.tienda.cl).
+#    Si quedan en dominios distintos, define DJANGO_COOKIE_SAMESITE=None.
+if not DEBUG:
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    SESSION_COOKIE_SAMESITE = CSRF_COOKIE_SAMESITE = os.environ.get('DJANGO_COOKIE_SAMESITE', 'Lax')
+
+
+# --- DRF: todo cerrado por defecto; cada vista pública o de usuario declara su permiso ---
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': ['rest_framework.permissions.IsAdminUser'],
+}
+
+
+# --- WEBPAY PLUS ---
+# Credenciales solo por variables de entorno. Las públicas de integración de Transbank
+# se usan como respaldo únicamente con DEBUG=True; con DEBUG=False y sin credenciales el pago falla.
+WEBPAY_COMMERCE_CODE = os.environ.get('WEBPAY_COMMERCE_CODE') or ('597055555532' if DEBUG else '')
+WEBPAY_API_KEY = os.environ.get('WEBPAY_API_KEY') or (
+    '579B532A7440BB0C9079DED94D31EA1615BACEB56610332264630D42D0A36B1C' if DEBUG else ''
+)
 
 
 # --- CORREO ---
