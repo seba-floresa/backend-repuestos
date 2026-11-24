@@ -7,6 +7,9 @@ from .models import (
     Vehiculo,
     CompatibilidadVehicular,
     Pedido,
+    DetallePedido,
+    TransaccionPago,
+    SolicitudEspecial,
 )
 
 
@@ -137,9 +140,68 @@ class RepuestoSerializer(serializers.ModelSerializer):
 
 
 class PedidoSerializer(serializers.ModelSerializer):
+    """Fila de la lista de pedidos del panel (solo administradores)."""
+    estado_nombre = serializers.CharField(source='get_estado_display', read_only=True)
+
     class Meta:
         model = Pedido
-        fields = '__all__'
+        fields = ['id', 'fecha_creacion', 'nombre_cliente', 'apellido_cliente', 'email_cliente',
+                  'monto_total', 'estado', 'estado_nombre']
+
+
+class DetallePedidoSerializer(serializers.ModelSerializer):
+    sku = serializers.CharField(source='repuesto.sku', read_only=True)
+    nombre = serializers.CharField(source='repuesto.nombre', read_only=True)
+    subtotal = serializers.SerializerMethodField()
+
+    class Meta:
+        model = DetallePedido
+        fields = ['id', 'repuesto', 'sku', 'nombre', 'cantidad', 'precio_historico', 'subtotal']
+
+    def get_subtotal(self, obj):
+        return obj.cantidad * obj.precio_historico
+
+
+class TransaccionPagoSerializer(serializers.ModelSerializer):
+    # Sin token_pasarela: no se necesita para gestionar el pedido
+    class Meta:
+        model = TransaccionPago
+        fields = ['id', 'estado_pago', 'monto_pagado', 'metodo_pago', 'codigo_autorizacion', 'fecha_transaccion']
+
+
+class PedidoDetalleSerializer(PedidoSerializer):
+    productos = DetallePedidoSerializer(source='detallepedido_set', many=True, read_only=True)
+    pagos = TransaccionPagoSerializer(source='transaccionpago_set', many=True, read_only=True)
+    comuna = serializers.CharField(source='tarifa.comuna', default='', read_only=True)
+    region = serializers.CharField(source='tarifa.region', default='', read_only=True)
+    siguiente_estado = serializers.SerializerMethodField()
+
+    class Meta(PedidoSerializer.Meta):
+        fields = PedidoSerializer.Meta.fields + [
+            'rut_cliente', 'telefono_cliente', 'patente_vin',
+            'direccion_calle', 'direccion_complemento', 'instrucciones_entrega', 'comuna', 'region',
+            'empresa_courier', 'codigo_seguimiento',
+            'subtotal', 'costo_envio', 'productos', 'pagos', 'siguiente_estado',
+        ]
+
+    def get_siguiente_estado(self, obj):
+        return Pedido.TRANSICIONES.get(obj.estado)
+
+
+class SolicitudEspecialSerializer(serializers.ModelSerializer):
+    estado_nombre = serializers.CharField(source='get_estado_display', read_only=True)
+    cliente_nombre = serializers.CharField(source='usuario.nombre_completo', read_only=True)
+    cliente_email = serializers.CharField(source='usuario.email', read_only=True)
+    cliente_telefono = serializers.CharField(source='usuario.telefono', read_only=True, default='')
+    valor_cotizado = serializers.IntegerField(min_value=0, required=False, allow_null=True)
+
+    class Meta:
+        model = SolicitudEspecial
+        fields = ['id', 'fecha_solicitud', 'cliente_nombre', 'cliente_email', 'cliente_telefono',
+                  'vin_vehiculo', 'pieza_requerida', 'nivel_urgencia',
+                  'estado', 'estado_nombre', 'valor_cotizado', 'comentario_admin']
+        # Lo que escribe el cliente no se edita desde el panel
+        read_only_fields = ['vin_vehiculo', 'pieza_requerida', 'nivel_urgencia']
 
 
 class VehiculoSerializer(serializers.ModelSerializer):

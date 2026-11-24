@@ -186,7 +186,29 @@ class Pedido(models.Model):
     subtotal = models.IntegerField()
     costo_envio = models.IntegerField()
     monto_total = models.IntegerField()
-    estado = models.CharField(max_length=30, db_index=True)
+
+    ESTADO_CHOICES = [
+        ('PENDIENTE_PAGO', 'Pendiente de pago'),
+        ('PAGADO', 'Pagado'),
+        ('REVISAR_STOCK', 'Pagado, revisar stock'),
+        ('EN_PREPARACION', 'En preparación'),
+        ('DESPACHADO', 'Despachado'),
+        ('ENTREGADO', 'Entregado'),
+        ('RECHAZADO', 'Rechazado'),
+        ('ANULADO', 'Anulado'),
+    ]
+    # Avance manual desde el panel: solo un paso hacia adelante.
+    # REVISAR_STOCK pasa a preparación cuando el administrador resuelve el faltante.
+    TRANSICIONES = {
+        'PAGADO': 'EN_PREPARACION',
+        'REVISAR_STOCK': 'EN_PREPARACION',
+        'EN_PREPARACION': 'DESPACHADO',
+        'DESPACHADO': 'ENTREGADO',
+    }
+    # Estados que cuentan como venta (el cliente pagó y el pedido sigue su curso)
+    ESTADOS_VENTA = ['PAGADO', 'EN_PREPARACION', 'DESPACHADO', 'ENTREGADO']
+
+    estado = models.CharField(max_length=30, db_index=True, choices=ESTADO_CHOICES)
 # 13. Detalle del Pedido
 class DetallePedido(models.Model):
     pedido = models.ForeignKey(Pedido, on_delete=models.CASCADE)
@@ -222,7 +244,12 @@ class SolicitudEspecial(models.Model):
     vin_vehiculo = models.CharField(max_length=17)
     pieza_requerida = models.CharField(max_length=200)
     nivel_urgencia = models.CharField(max_length=15)
-    estado = models.CharField(max_length=20, db_index=True)
+    ESTADO_CHOICES = [
+        ('PENDIENTE', 'Pendiente'),
+        ('EN_GESTION', 'En gestión'),
+        ('RESUELTA', 'Resuelta'),
+    ]
+    estado = models.CharField(max_length=20, db_index=True, choices=ESTADO_CHOICES)
     valor_cotizado = models.IntegerField(blank=True, null=True)
     comentario_admin = models.TextField(blank=True, null=True)
     fecha_solicitud = models.DateTimeField(auto_now_add=True)

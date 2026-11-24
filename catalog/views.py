@@ -1,10 +1,12 @@
-from rest_framework import viewsets, status
+from rest_framework import viewsets, status, mixins
+from rest_framework.decorators import action
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
-from django.db.models import Q, Sum, Count, F, ProtectedError
-from django.db.models.functions import TruncDate
+from django.db.models import Q, Sum, Count, F, Max, OuterRef, Subquery, ProtectedError
+from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser
@@ -44,6 +46,8 @@ from .serializers import (
     SubcategoriaSerializer,
     VehiculoSerializer,
     PedidoSerializer,
+    PedidoDetalleSerializer,
+    SolicitudEspecialSerializer,
 )
 from .services.vin_service import MockBuscadorVehiculo
 
@@ -287,11 +291,149 @@ class RepuestoViewSet(viewsets.ModelViewSet):
             )
 
 
-class PedidoViewSet(viewsets.ModelViewSet):
-    # Contiene datos personales (RUT, correo, dirección): solo administradores
-    queryset = Pedido.objects.all()
-    serializer_class = PedidoSerializer
+def _fecha_param(request, nombre):
+    """Fecha YYYY-MM-DD de la URL (o None). Responde 400 si viene mal escrita."""
+    texto = request.query_params.get(nombre, '').strip()
+    if not texto:
+        return None
+    try:
+        return date.fromisoformat(texto)
+    except ValueError:
+        raise DRFValidationError({nombre: 'Fecha inválida, usa el formato AAAA-MM-DD.'})
+
+
+class PedidoViewSet(viewsets.ReadOnlyModelViewSet):
+    # Contiene datos personales (RUT, correo, dirección): solo administradores.
+    # Solo lectura: el estado cambia únicamente por avanzar_estado, que valida la transición.
+    queryset = Pedido.objects.select_related('tarifa').order_by('-fecha_creacion', '-id')
     permission_classes = [IsAdminUser]
+    pagination_class = PaginacionOpcional
+
+    def get_serializer_class(self):
+        return PedidoSerializer if self.action == 'list' else PedidoDetalleSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.action != 'list':
+            return qs.prefetch_related('detallepedido_set__repuesto', 'transaccionpago_set')
+        p = self.request.query_params
+        if p.get('estado'):
+            qs = qs.filter(estado=p['estado'])
+        desde, hasta = _fecha_param(self.request, 'desde'), _fecha_param(self.request, 'hasta')
+        # Días completos en hora de Chile
+        if desde:
+            qs = qs.filter(fecha_creacion__gte=datetime.combine(desde, time.min, tzinfo=ZONA_CHILE))
+        if hasta:
+            qs = qs.filter(fecha_creacion__lt=datetime.combine(hasta + timedelta(days=1), time.min, tzinfo=ZONA_CHILE))
+        q = p.get('q', '').strip()
+        if q:
+            qs = qs.filter(Q(email_cliente__icontains=q) | Q(nombre_cliente__icontains=q) | Q(apellido_cliente__icontains=q))
+        return qs
+
+    @action(detail=True, methods=['post'], url_path='avanzar-estado')
+    def avanzar_estado(self, request, pk=None):
+        pedido = self.get_object()
+        nuevo = request.data.get('estado')
+        esperado = Pedido.TRANSICIONES.get(pedido.estado)
+        if not esperado or nuevo != esperado:
+            permitido = f' Solo puede pasar a {esperado}.' if esperado else ' Este estado no se puede avanzar.'
+            return Response({'error': f'No se puede pasar de {pedido.estado} a {nuevo}.{permitido}'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        cambios = {'estado': nuevo}
+        if nuevo == 'DESPACHADO':
+            courier = (request.data.get('empresa_courier') or '').strip()
+            seguimiento = (request.data.get('codigo_seguimiento') or '').strip()
+            errores = {}
+            if not courier:
+                errores['empresa_courier'] = 'Indica la empresa de courier.'
+            if not seguimiento:
+                errores['codigo_seguimiento'] = 'Indica el código de seguimiento.'
+            if errores:
+                return Response(errores, status=status.HTTP_400_BAD_REQUEST)
+            cambios.update(empresa_courier=courier[:50], codigo_seguimiento=seguimiento[:80])
+
+        # Actualiza solo si nadie lo cambió entre tanto (SQLite no bloquea con select_for_update)
+        if not Pedido.objects.filter(pk=pedido.pk, estado=pedido.estado).update(**cambios):
+            return Response({'error': 'El pedido cambió mientras lo editabas. Recarga y vuelve a intentar.'},
+                            status=status.HTTP_409_CONFLICT)
+        pedido.refresh_from_db()
+        return Response(PedidoDetalleSerializer(pedido).data)
+
+
+class SolicitudEspecialAdminViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
+                                    mixins.UpdateModelMixin, viewsets.GenericViewSet):
+    """Solicitudes especiales (HU-02) para el panel: ver y cambiar estado, cotización y comentario."""
+    queryset = SolicitudEspecial.objects.select_related('usuario').order_by('-fecha_solicitud', '-id')
+    serializer_class = SolicitudEspecialSerializer
+    permission_classes = [IsAdminUser]
+    pagination_class = PaginacionOpcional
+    http_method_names = ['get', 'patch', 'head', 'options']
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.action != 'list':
+            return qs
+        p = self.request.query_params
+        if p.get('estado'):
+            qs = qs.filter(estado=p['estado'])
+        q = p.get('q', '').strip()
+        if q:
+            qs = qs.filter(Q(usuario__email__icontains=q) | Q(usuario__nombre_completo__icontains=q)
+                           | Q(pieza_requerida__icontains=q))
+        return qs
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def clientes_admin_api_view(request):
+    """Clientes derivados de los pedidos, agrupados por correo (el checkout lo guarda en minúsculas)."""
+    pedidos = Pedido.objects.exclude(email_cliente='')
+    q = request.query_params.get('q', '').strip()
+    if q:
+        pedidos = pedidos.filter(Q(email_cliente__icontains=q) | Q(nombre_cliente__icontains=q) | Q(apellido_cliente__icontains=q))
+
+    venta = Q(estado__in=Pedido.ESTADOS_VENTA)
+    ultimo = Pedido.objects.filter(email_cliente=OuterRef('email_cliente')).order_by('-fecha_creacion')
+    clientes = (
+        pedidos.values('email_cliente')
+        .annotate(
+            pedidos=Count('id'),
+            pedidos_pagados=Count('id', filter=venta),
+            total_gastado=Coalesce(Sum('monto_total', filter=venta), 0),
+            ultima_compra=Max('fecha_creacion', filter=venta),
+            nombre=Subquery(ultimo.values('nombre_cliente')[:1]),
+            apellido=Subquery(ultimo.values('apellido_cliente')[:1]),
+        )
+        .order_by(F('ultima_compra').desc(nulls_last=True), 'email_cliente')
+    )
+    paginador = PaginacionOpcional()
+    pagina = paginador.paginate_queryset(clientes, request)
+    if pagina is None:
+        return Response(list(clientes))
+    return paginador.get_paginated_response(pagina)
+
+
+@api_view(['GET'])
+@permission_classes([IsAdminUser])
+def cliente_detalle_admin_api_view(request):
+    email = request.query_params.get('email', '').strip().lower()
+    pedidos = Pedido.objects.filter(email_cliente=email).order_by('-fecha_creacion', '-id') if email else Pedido.objects.none()
+    ultimo = pedidos.first()
+    if not ultimo:
+        return Response({'error': 'No hay pedidos con ese correo.'}, status=status.HTTP_404_NOT_FOUND)
+    ventas = pedidos.filter(estado__in=Pedido.ESTADOS_VENTA)
+    return Response({
+        'email': email,
+        'nombre': ultimo.nombre_cliente,
+        'apellido': ultimo.apellido_cliente,
+        'rut': ultimo.rut_cliente,
+        'telefono': ultimo.telefono_cliente,
+        'pedidos_pagados': ventas.count(),
+        'total_gastado': ventas.aggregate(t=Sum('monto_total'))['t'] or 0,
+        'ultima_compra': ventas.aggregate(f=Max('fecha_creacion'))['f'],
+        'pedidos': PedidoSerializer(pedidos, many=True).data,
+    })
 
 
 class BuscarVehiculoAPIView(APIView):
@@ -829,12 +971,12 @@ def resumen_admin_api_view(request):
     pedidos = Pedido.objects.all()
     dias = PERIODOS_RESUMEN[periodo]
     if dias is None:
-        primera = pedidos.filter(estado='PAGADO').order_by('fecha_creacion').first()
+        primera = pedidos.filter(estado__in=Pedido.ESTADOS_VENTA).order_by('fecha_creacion').first()
         desde = timezone.localdate(primera.fecha_creacion, ZONA_CHILE) if primera else hoy
     else:
         desde = hoy - timedelta(days=dias)
         pedidos = pedidos.filter(fecha_creacion__gte=datetime.combine(desde, time.min, tzinfo=ZONA_CHILE))
-    pagados = pedidos.filter(estado='PAGADO')
+    pagados = pedidos.filter(estado__in=Pedido.ESTADOS_VENTA)  # pagados que siguen su curso
 
     totales = pagados.aggregate(ventas=Sum('monto_total'), cantidad=Count('id'))
     ventas = totales['ventas'] or 0

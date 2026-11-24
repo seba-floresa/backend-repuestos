@@ -268,3 +268,174 @@ class ResumenAdminTest(TestCase):
         self.assertEqual(todo['ventas_totales'], 13000)
         self.assertEqual(todo['mas_vendidos'][0]['nombre'], 'B')
         self.assertGreaterEqual(len(todo['ventas_por_dia']), 60)
+
+    def test_pedidos_en_curso_siguen_contando_como_venta(self):
+        for estado in ['EN_PREPARACION', 'DESPACHADO', 'ENTREGADO']:
+            self.pedido(1000, estado=estado)
+        self.client.force_login(_admin())
+        self.assertEqual(self.client.get(self.URL + '?periodo=7d').json()['ventas_totales'], 7000)
+
+
+from . import views
+from .models import TarifaDespacho, TransaccionPago
+
+
+def _pedido(email='ana@cliente.cl', estado='PAGADO', monto=10000, nombre='Ana', hace_dias=0):
+    p = Pedido.objects.create(direccion_calle='Calle 1', subtotal=monto, costo_envio=0, monto_total=monto,
+                              estado=estado, email_cliente=email, nombre_cliente=nombre, rut_cliente='11111111-1')
+    if hace_dias:
+        Pedido.objects.filter(id=p.id).update(fecha_creacion=timezone.now() - timedelta(days=hace_dias))
+    return p
+
+
+class PermisosPanelTest(TestCase):
+    """Datos de clientes, pedidos y solicitudes: solo para is_staff."""
+    def test_rechaza_anonimos_y_clientes(self):
+        p = _pedido()
+        u = Usuario.objects.create(rut='1-9', nombre_completo='x', email='x@x.cl', password_hash='x', rol='cliente')
+        s = SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='x', pieza_requerida='x', nivel_urgencia='x', estado='PENDIENTE')
+        urls = ['/api/pedidos/', f'/api/pedidos/{p.id}/', '/api/admin/solicitudes/', f'/api/admin/solicitudes/{s.id}/',
+                '/api/admin/clientes/', '/api/admin/clientes/detalle/?email=ana@cliente.cl']
+        for usuario in [None, User.objects.create_user('cliente', 'c@c.cl', 'x')]:
+            if usuario:
+                self.client.force_login(usuario)
+            for url in urls:
+                self.assertEqual(self.client.get(url).status_code, 403, url)
+            r = self.client.post(f'/api/pedidos/{p.id}/avanzar-estado/', {'estado': 'EN_PREPARACION'}, content_type='application/json')
+            self.assertEqual(r.status_code, 403)
+            r = self.client.patch(f'/api/admin/solicitudes/{s.id}/', {'estado': 'RESUELTA'}, content_type='application/json')
+            self.assertEqual(r.status_code, 403)
+        self.assertEqual(Pedido.objects.get(id=p.id).estado, 'PAGADO')
+        self.client.force_login(_admin())
+        for url in urls:
+            self.assertEqual(self.client.get(url).status_code, 200, url)
+
+    def test_pedidos_no_se_editan_directamente(self):
+        p = _pedido()
+        self.client.force_login(_admin())
+        r = self.client.patch(f'/api/pedidos/{p.id}/', {'estado': 'ENTREGADO'}, content_type='application/json')
+        self.assertEqual(r.status_code, 405)
+        self.assertEqual(self.client.delete(f'/api/pedidos/{p.id}/').status_code, 405)
+
+
+class PedidosAdminTest(TestCase):
+    def setUp(self):
+        self.client.force_login(_admin())
+
+    def avanzar(self, pedido, estado, **extra):
+        return self.client.post(f'/api/pedidos/{pedido.id}/avanzar-estado/', {'estado': estado, **extra},
+                                content_type='application/json')
+
+    def test_avance_completo_y_datos_de_despacho(self):
+        p = _pedido()
+        self.assertEqual(self.avanzar(p, 'EN_PREPARACION').json()['estado'], 'EN_PREPARACION')
+        r = self.avanzar(p, 'DESPACHADO')
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(set(r.json()), {'empresa_courier', 'codigo_seguimiento'})
+        r = self.avanzar(p, 'DESPACHADO', empresa_courier='Starken', codigo_seguimiento='ABC123')
+        self.assertEqual((r.json()['estado'], r.json()['empresa_courier']), ('DESPACHADO', 'Starken'))
+        r = self.avanzar(p, 'ENTREGADO').json()
+        self.assertEqual((r['estado'], r['siguiente_estado']), ('ENTREGADO', None))
+
+    def test_no_salta_ni_retrocede(self):
+        p = _pedido()
+        self.assertEqual(self.avanzar(p, 'DESPACHADO', empresa_courier='x', codigo_seguimiento='y').status_code, 400)
+        self.assertEqual(self.avanzar(p, 'ENTREGADO').status_code, 400)
+        self.assertEqual(self.avanzar(p, 'ESTADO_INVENTADO').status_code, 400)
+        self.avanzar(p, 'EN_PREPARACION')
+        self.assertEqual(self.avanzar(p, 'PAGADO').status_code, 400)
+        self.assertEqual(self.avanzar(p, 'EN_PREPARACION').status_code, 400)
+        self.assertEqual(Pedido.objects.get(id=p.id).estado, 'EN_PREPARACION')
+
+    def test_estados_sin_pago_o_finales_no_avanzan(self):
+        for estado in ['PENDIENTE_PAGO', 'RECHAZADO', 'ANULADO', 'ENTREGADO']:
+            r = self.avanzar(_pedido(estado=estado), 'EN_PREPARACION')
+            self.assertEqual(r.status_code, 400, estado)
+
+    def test_revisar_stock_pasa_a_preparacion(self):
+        p = _pedido(estado='REVISAR_STOCK')
+        self.assertEqual(self.avanzar(p, 'EN_PREPARACION').status_code, 200)
+
+    def test_conflicto_si_otro_lo_cambio_antes(self):
+        p = _pedido()
+        from unittest import mock
+        # Simula que otro administrador avanzó el pedido entre la lectura y la escritura
+        original = views.PedidoViewSet.get_object
+        def leer_y_cambiar(vista):
+            obj = original(vista)
+            Pedido.objects.filter(id=obj.id).update(estado='EN_PREPARACION')
+            return obj
+        with mock.patch.object(views.PedidoViewSet, 'get_object', leer_y_cambiar):
+            self.assertEqual(self.avanzar(p, 'EN_PREPARACION').status_code, 409)
+
+    def test_filtros_y_detalle(self):
+        tarifa = TarifaDespacho.objects.create(region='RM', comuna='Ñuñoa', costo_base_kg=1000, dias_habiles_estimados=2)
+        cat = Categoria.objects.create(nombre='Filtros')
+        rep = Repuesto.objects.create(categoria=cat, nombre='Filtro', precio_unitario=5000)
+        p = _pedido(email='pedro@x.cl', nombre='Pedro', monto=10000)
+        Pedido.objects.filter(id=p.id).update(tarifa=tarifa)
+        DetallePedido.objects.create(pedido=p, repuesto=rep, cantidad=2, precio_historico=5000)
+        TransaccionPago.objects.create(pedido=p, token_pasarela='tok', monto_pagado=10000, estado_pago='APROBADO')
+        _pedido(estado='RECHAZADO')
+        _pedido(hace_dias=10)
+
+        def ids(qs):
+            return [x['id'] for x in self.client.get(f'/api/pedidos/?page=1&{qs}').json()['results']]
+        self.assertEqual(ids('q=pedro'), [p.id])
+        self.assertEqual(ids('q=PEDRO@X'), [p.id])
+        self.assertEqual(len(ids('estado=PAGADO')), 2)
+        hoy = timezone.localdate(timezone=views.ZONA_CHILE).isoformat()
+        self.assertEqual(len(ids(f'desde={hoy}&hasta={hoy}')), 2)
+        self.assertEqual(self.client.get('/api/pedidos/?desde=24-11-2026').status_code, 400)
+
+        d = self.client.get(f'/api/pedidos/{p.id}/').json()
+        self.assertEqual(d['productos'][0]['subtotal'], 10000)
+        self.assertEqual((d['comuna'], d['pagos'][0]['estado_pago']), ('Ñuñoa', 'APROBADO'))
+        self.assertNotIn('token_pasarela', d['pagos'][0])
+        self.assertEqual(d['siguiente_estado'], 'EN_PREPARACION')
+
+
+class SolicitudesAdminTest(TestCase):
+    def setUp(self):
+        u = Usuario.objects.create(rut='1-9', nombre_completo='Juan Pérez', email='juan@x.cl', password_hash='x', rol='cliente')
+        self.s = SolicitudEspecial.objects.create(usuario=u, vin_vehiculo='VIN1', pieza_requerida='Foco trasero',
+                                                  nivel_urgencia='ALTA', estado='PENDIENTE')
+        self.client.force_login(_admin())
+        self.url = f'/api/admin/solicitudes/{self.s.id}/'
+
+    def test_lista_detalle_y_cambio_de_estado(self):
+        data = self.client.get('/api/admin/solicitudes/?page=1&q=foco').json()
+        self.assertEqual(data['results'][0]['cliente_nombre'], 'Juan Pérez')
+        self.assertEqual(self.client.get('/api/admin/solicitudes/?page=1&estado=RESUELTA').json()['count'], 0)
+        r = self.client.patch(self.url, {'estado': 'EN_GESTION', 'valor_cotizado': 45000, 'comentario_admin': 'Llega el martes',
+                                         'pieza_requerida': 'otra cosa'}, content_type='application/json')
+        self.assertEqual((r.json()['estado_nombre'], r.json()['valor_cotizado']), ('En gestión', 45000))
+        self.assertEqual(r.json()['pieza_requerida'], 'Foco trasero')  # lo escrito por el cliente no cambia
+
+    def test_valida_estado_y_valor(self):
+        self.assertEqual(self.client.patch(self.url, {'estado': 'CERRADA'}, content_type='application/json').status_code, 400)
+        self.assertEqual(self.client.patch(self.url, {'valor_cotizado': -1}, content_type='application/json').status_code, 400)
+        self.assertEqual(self.client.put(self.url, {'estado': 'RESUELTA'}, content_type='application/json').status_code, 405)
+        self.assertEqual(self.client.delete(self.url).status_code, 405)
+
+
+class ClientesAdminTest(TestCase):
+    def setUp(self):
+        _pedido('ana@cliente.cl', monto=10000, hace_dias=5, nombre='Ana')
+        _pedido('ana@cliente.cl', estado='DESPACHADO', monto=5000, hace_dias=1, nombre='Ana María')
+        _pedido('ana@cliente.cl', estado='RECHAZADO', monto=99000)
+        _pedido('beto@cliente.cl', estado='PENDIENTE_PAGO', monto=3000, nombre='Beto')
+        self.client.force_login(_admin())
+
+    def test_lista_agrupada_por_correo(self):
+        clientes = self.client.get('/api/admin/clientes/').json()
+        self.assertEqual([c['email_cliente'] for c in clientes], ['ana@cliente.cl', 'beto@cliente.cl'])
+        ana, beto = clientes
+        self.assertEqual((ana['pedidos'], ana['pedidos_pagados'], ana['total_gastado'], ana['nombre']), (3, 2, 15000, 'Ana'))
+        self.assertEqual((beto['total_gastado'], beto['ultima_compra']), (0, None))
+        self.assertEqual(self.client.get('/api/admin/clientes/?page=1&q=beto').json()['count'], 1)
+
+    def test_detalle_con_historial(self):
+        r = self.client.get('/api/admin/clientes/detalle/?email=ANA@cliente.cl').json()
+        self.assertEqual((r['total_gastado'], len(r['pedidos']), r['rut']), (15000, 3, '11111111-1'))
+        self.assertEqual(self.client.get('/api/admin/clientes/detalle/?email=nadie@x.cl').status_code, 404)

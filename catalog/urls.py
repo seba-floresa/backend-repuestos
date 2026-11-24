@@ -17,6 +17,9 @@ from .views import (
     tarifas_despacho_api_view,
     webpay_retorno_view,
     resumen_admin_api_view,
+    SolicitudEspecialAdminViewSet,
+    clientes_admin_api_view,
+    cliente_detalle_admin_api_view,
 )
 
 router = DefaultRouter()
@@ -25,6 +28,7 @@ router.register(r'subcategorias', SubcategoriaViewSet)
 router.register(r'vehiculos', VehiculoViewSet)
 router.register(r'repuestos', RepuestoViewSet)
 router.register(r'pedidos', PedidoViewSet)
+router.register(r'admin/solicitudes', SolicitudEspecialAdminViewSet)
 
 urlpatterns = [
     # Antes del router para que no se confunda con repuestos/<id>/
@@ -42,4 +46,6 @@ urlpatterns = [
     path('webpay/retorno/', webpay_retorno_view, name='webpay-retorno'),
     path('mi-perfil/', mi_perfil_api_view, name='api-mi-perfil'),
     path('admin/resumen/', resumen_admin_api_view, name='api-admin-resumen'),
+    path('admin/clientes/', clientes_admin_api_view, name='api-admin-clientes'),
+    path('admin/clientes/detalle/', cliente_detalle_admin_api_view, name='api-admin-cliente-detalle'),
 ]
