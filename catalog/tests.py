@@ -668,3 +668,140 @@ class SettingsProduccionTest(TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(),
                          "True False False True ['localhost', '127.0.0.1'] ['http://localhost:4200']")
+
+
+# --- Cuenta del cliente: perfil, contraseña, eliminación, vehículos y pedidos ---
+
+from .models import VehiculoCliente
+
+
+class CuentaClienteTest(TestCase):
+    CLAVE = 'ClaveSegura123'
+
+    def crear_cliente(self, email, rut, nombre='Ana Pérez'):
+        usuario = Usuario.objects.create(rut=rut, nombre_completo=nombre, email=email, password_hash='x',
+                                         telefono='+56911112222', rol='CLIENTE')
+        user = User.objects.create_user(email, email, self.CLAVE, first_name=nombre.split()[0])
+        return usuario, user
+
+    def setUp(self):
+        self.ana, self.user_ana = self.crear_cliente('ana@x.cl', '11111111-1')
+        self.beto, self.user_beto = self.crear_cliente('beto@x.cl', '22222222-2', 'Beto Soto')
+        self.veh = Vehiculo.objects.create(marca='Toyota', modelo='Yaris', anio_inicio=2015, anio_fin=2020)
+        self.veh_ana = VehiculoCliente.objects.create(usuario=self.ana, vehiculo_base=self.veh, patente='AAAA11')
+        self.veh_beto = VehiculoCliente.objects.create(usuario=self.beto, vehiculo_base=self.veh, patente='BBBB22')
+        self.cat = Categoria.objects.create(nombre='Filtros')
+        self.rep = Repuesto.objects.create(categoria=self.cat, nombre='Filtro aceite', precio_unitario=5000, stock_disponible=5)
+        self.pedido_ana = _pedido(email='ana@x.cl', estado='DESPACHADO', hace_dias=2)
+        Pedido.objects.filter(id=self.pedido_ana.id).update(usuario=self.ana, empresa_courier='Starken',
+                                                            codigo_seguimiento='ABC 123', subtotal=10000, costo_envio=3000,
+                                                            monto_total=13000)
+        DetallePedido.objects.create(pedido=self.pedido_ana, repuesto=self.rep, cantidad=2, precio_historico=5000)
+        self.invitado_ana = _pedido(email='ANA@x.cl')  # compra como invitada con su mismo correo
+        self.pedido_beto = _pedido(email='beto@x.cl')
+        Pedido.objects.filter(id=self.pedido_beto.id).update(usuario=self.beto)
+
+    def json(self, metodo, url, data=None):
+        return getattr(self.client, metodo)(url, data or {}, content_type='application/json')
+
+    def test_anonimo_recibe_403(self):
+        rutas = [('get', '/api/mi-perfil/'), ('patch', '/api/mi-perfil/'), ('post', '/api/mi-perfil/cambiar-password/'),
+                 ('post', '/api/mi-perfil/eliminar-cuenta/'), ('get', '/api/mis-vehiculos/'),
+                 ('delete', f'/api/mis-vehiculos/{self.veh_ana.id}/'), ('get', '/api/mis-pedidos/'),
+                 ('get', f'/api/mis-pedidos/{self.pedido_ana.id}/')]
+        for metodo, url in rutas:
+            self.assertEqual(self.json(metodo, url).status_code, 403, f'{metodo} {url}')
+        self.assertTrue(VehiculoCliente.objects.filter(id=self.veh_ana.id).exists())
+
+    def test_cliente_no_ve_lo_de_otro(self):
+        self.client.force_login(self.user_ana)
+        ids = [p['id'] for p in self.client.get('/api/mis-pedidos/').json()]
+        self.assertEqual(sorted(ids), sorted([self.pedido_ana.id, self.invitado_ana.id]))
+        self.assertEqual(self.client.get(f'/api/mis-pedidos/{self.pedido_beto.id}/').status_code, 404)
+        self.assertEqual([v['patente'] for v in self.client.get('/api/mis-vehiculos/').json()], ['AAAA11'])
+        self.assertEqual(self.client.delete(f'/api/mis-vehiculos/{self.veh_beto.id}/').status_code, 404)
+        self.assertTrue(VehiculoCliente.objects.filter(id=self.veh_beto.id).exists())
+        self.assertEqual(self.client.delete(f'/api/mis-vehiculos/{self.veh_ana.id}/').status_code, 204)
+        self.assertFalse(VehiculoCliente.objects.filter(id=self.veh_ana.id).exists())
+
+    def test_lista_y_detalle_de_pedidos(self):
+        self.client.force_login(self.user_ana)
+        lista = self.client.get('/api/mis-pedidos/').json()
+        self.assertEqual(lista[0]['id'], self.invitado_ana.id)  # más reciente primero
+        despachado = next(p for p in lista if p['id'] == self.pedido_ana.id)
+        self.assertEqual((despachado['monto_total'], despachado['cantidad_items'], despachado['estado']), (13000, 2, 'DESPACHADO'))
+        d = self.client.get(f'/api/mis-pedidos/{self.pedido_ana.id}/').json()
+        self.assertEqual(d['productos'], [{'nombre': 'Filtro aceite', 'sku': self.rep.sku, 'cantidad': 2,
+                                           'precio': 5000, 'subtotal': 10000}])
+        self.assertEqual((d['subtotal'], d['costo_envio'], d['monto_total']), (10000, 3000, 13000))
+        for privado in ('pagos', 'rut_cliente', 'telefono_cliente', 'email_cliente'):
+            self.assertNotIn(privado, d)
+
+    @override_settings(COURIER_TRACKING_URLS={'starken': 'https://x.cl/seguir?c={codigo}'})
+    def test_seguimiento_url(self):
+        self.client.force_login(self.user_ana)
+        url = f'/api/mis-pedidos/{self.pedido_ana.id}/'
+        self.assertEqual(self.client.get(url).json()['seguimiento_url'], 'https://x.cl/seguir?c=ABC%20123')
+        Pedido.objects.filter(id=self.pedido_ana.id).update(empresa_courier='Courier Desconocido')
+        d = self.client.get(url).json()
+        self.assertIsNone(d['seguimiento_url'])
+        self.assertEqual(d['codigo_seguimiento'], 'ABC 123')
+
+    def test_editar_perfil(self):
+        self.client.force_login(self.user_ana)
+        r = self.json('patch', '/api/mi-perfil/', {'nombre_completo': '  Ana  María Rojas ', 'telefono': '987654321',
+                                                   'email': 'otro@x.cl', 'rut': '33333333-3'})
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertEqual((r.json()['nombre_completo'], r.json()['celular']), ('Ana María Rojas', '987654321'))
+        self.ana.refresh_from_db()
+        self.user_ana.refresh_from_db()
+        # Correo y RUT son de solo lectura: se ignoran
+        self.assertEqual((self.ana.telefono, self.ana.email, self.ana.rut), ('+56987654321', 'ana@x.cl', '11111111-1'))
+        self.assertEqual((self.user_ana.first_name, self.user_ana.last_name), ('Ana', 'María Rojas'))
+        for malo in ('12345678', '9876543210', 'abc'):
+            self.assertEqual(self.json('patch', '/api/mi-perfil/', {'telefono': malo}).status_code, 400, malo)
+        self.assertEqual(self.json('patch', '/api/mi-perfil/', {'nombre_completo': ' '}).status_code, 400)
+
+    def test_cambiar_password(self):
+        self.client.force_login(self.user_ana)
+        url = '/api/mi-perfil/cambiar-password/'
+        r = self.json('post', url, {'password_actual': 'mala', 'password_nueva': 'OtraClave456'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('actual', r.json()['error'])
+        r = self.json('post', url, {'password_actual': self.CLAVE, 'password_nueva': '123'})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn('contraseña', r.json()['error'])  # validadores de Django, en español
+        r = self.json('post', url, {'password_actual': self.CLAVE, 'password_nueva': 'OtraClave456'})
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(self.client.get('/api/mi-perfil/').status_code, 200)  # la sesión sigue activa
+        self.user_ana.refresh_from_db()
+        self.assertTrue(self.user_ana.check_password('OtraClave456'))
+
+    def test_eliminar_cuenta(self):
+        self.client.force_login(self.user_ana)
+        url = '/api/mi-perfil/eliminar-cuenta/'
+        self.assertEqual(self.json('post', url, {'password': 'mala'}).status_code, 400)
+        self.assertEqual(self.json('post', url, {'password': self.CLAVE}).status_code, 200)
+        self.ana.refresh_from_db()
+        self.user_ana.refresh_from_db()
+        correo = f'eliminado-{self.ana.id}@repuestosrs.invalid'
+        self.assertEqual((self.ana.nombre_completo, self.ana.email, self.ana.telefono), ('Cuenta eliminada', correo, ''))
+        self.assertNotEqual(self.ana.rut, '11111111-1')
+        self.assertFalse(self.user_ana.is_active)
+        self.assertEqual(self.user_ana.email, f'eliminado-{self.user_ana.id}@repuestosrs.invalid')
+        self.assertFalse(VehiculoCliente.objects.filter(usuario=self.ana).exists())
+        self.assertTrue(VehiculoCliente.objects.filter(id=self.veh_beto.id).exists())
+        self.assertEqual(Pedido.objects.get(id=self.pedido_ana.id).usuario_id, self.ana.id)  # el pedido se conserva
+        # La sesión se cerró y no se puede volver a entrar
+        self.assertEqual(self.client.get('/api/mi-perfil/').status_code, 403)
+        r = self.json('post', '/api/login/', {'email': 'ana@x.cl', 'password': self.CLAVE})
+        self.assertEqual(r.status_code, 401)
+
+    def test_admin_no_se_elimina(self):
+        admin = User.objects.create_user('jefe@x.cl', 'jefe@x.cl', self.CLAVE, is_staff=True)
+        self.client.force_login(admin)
+        r = self.json('post', '/api/mi-perfil/eliminar-cuenta/', {'password': self.CLAVE})
+        self.assertEqual(r.status_code, 403)
+        self.assertIn('administrador', r.json()['error'])
+        admin.refresh_from_db()
+        self.assertTrue(admin.is_active)

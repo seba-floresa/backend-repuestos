@@ -193,6 +193,16 @@ WEBPAY_API_KEY = os.environ.get('WEBPAY_API_KEY') or (
 )
 
 
+# --- SEGUIMIENTO DE ENVÍOS ---
+# {nombre_normalizado: plantilla}. La clave es el nombre del courier en minúsculas, sin tildes, espacios
+# ni símbolos ("Blue Express" -> "blueexpress"). {codigo} se reemplaza por el código de seguimiento.
+# Si el courier no está aquí, el cliente ve solo el código (seguimiento_url = null).
+COURIER_TRACKING_URLS = {
+    # TODO: verificar la URL real de seguimiento en starken.cl antes de producción (esta plantilla no está confirmada).
+    'starken': 'https://www.starken.cl/seguimiento?codigo={codigo}',
+}
+
+
 # --- CORREO ---
 # Todo sale de variables de entorno (ver .env.example). Con DEBUG los correos se imprimen en la terminal.
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND') or (

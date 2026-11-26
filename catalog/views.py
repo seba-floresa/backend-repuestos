@@ -7,7 +7,7 @@ from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 from django.db.models import Q, Sum, Count, F, Max, OuterRef, Subquery, ProtectedError
 from django.db.models.functions import Coalesce, TruncDate
-from django.utils import timezone
+from django.utils import timezone, translation
 from rest_framework.response import Response
 from django.conf import settings
 from django.contrib.auth import authenticate, login as django_login, logout as django_logout
@@ -18,7 +18,7 @@ from rest_framework.permissions import AllowAny, BasePermission, IsAdminUser
 
 import os
 import requests
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from django.http import HttpResponseRedirect
 from django.views.decorators.csrf import csrf_exempt
 
@@ -564,13 +564,48 @@ def _usuario_de_sesion(request):
     correo = request.user.email or request.user.username
     return Usuario.objects.filter(email__iexact=correo).first()
 
-@api_view(['GET'])
+def _telefono_valido(texto):
+    """Mismo criterio del registro: 9 dígitos después del +56 (acepta que venga con +56). Devuelve '+56XXXXXXXXX' o None."""
+    digitos = re.sub(r'\D', '', texto or '')
+    if len(digitos) == 11 and digitos.startswith('56'):
+        digitos = digitos[2:]
+    return f'+56{digitos}' if len(digitos) == 9 else None
+
+
+def _separar_nombre(nombre_completo):
+    partes = nombre_completo.split(' ', 1)
+    return partes[0], partes[1] if len(partes) > 1 else ''
+
+
+@api_view(['GET', 'PATCH'])
 @permission_classes([SesionIniciada])
 def mi_perfil_api_view(request):
-    """Datos del cliente con sesión iniciada, para autocompletar el checkout."""
+    """Datos del cliente con sesión iniciada (checkout y "Editar perfil"). Solo nombre y teléfono son editables."""
     usuario = _usuario_de_sesion(request)
     if not usuario:
         return Response({'error': 'Sin sesión de cliente.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    if request.method == 'PATCH':
+        errores = {}
+        nombre_completo = ' '.join(str(request.data.get('nombre_completo', usuario.nombre_completo)).split())
+        if len(nombre_completo) < 2:
+            errores['nombre_completo'] = 'Ingresa tu nombre completo.'
+        elif len(nombre_completo) > 120:
+            errores['nombre_completo'] = 'El nombre no puede superar los 120 caracteres.'
+        telefono = usuario.telefono
+        if 'telefono' in request.data:
+            telefono = _telefono_valido(str(request.data.get('telefono') or ''))
+            if not telefono:
+                errores['telefono'] = 'El teléfono debe tener 9 dígitos después del +56.'
+        if errores:
+            return Response({'error': next(iter(errores.values())), **errores}, status=status.HTTP_400_BAD_REQUEST)
+
+        with transaction.atomic():
+            usuario.nombre_completo, usuario.telefono = nombre_completo, telefono
+            usuario.save(update_fields=['nombre_completo', 'telefono'])
+            user = request.user
+            user.first_name, user.last_name = (s[:150] for s in _separar_nombre(nombre_completo))
+            user.save(update_fields=['first_name', 'last_name'])
 
     partes = usuario.nombre_completo.split(' ', 1)
     nombre = request.user.first_name or partes[0]
@@ -586,7 +621,171 @@ def mi_perfil_api_view(request):
         'nombre': nombre,
         'apellido': apellido,
         'rut': rut,
-        'telefono': digitos[-8:],  # el formulario ya muestra "+56 9" aparte
+        'telefono': digitos[-8:],  # el checkout ya muestra "+56 9" aparte
+        # Para "Editar perfil"
+        'nombre_completo': usuario.nombre_completo,
+        'celular': digitos[-9:],  # el perfil muestra "+56" aparte, como el registro
+    })
+
+
+@api_view(['POST'])
+@permission_classes([SesionIniciada])
+def cambiar_password_api_view(request):
+    from django.contrib.auth import update_session_auth_hash
+    from django.contrib.auth.hashers import make_password
+    from django.contrib.auth.password_validation import validate_password
+
+    user = request.user
+    actual = request.data.get('password_actual') or ''
+    nueva = request.data.get('password_nueva') or ''
+    if not user.check_password(actual):
+        return Response({'error': 'La contraseña actual no es correcta.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not nueva:
+        return Response({'error': 'Ingresa la nueva contraseña.'}, status=status.HTTP_400_BAD_REQUEST)
+    # LANGUAGE_CODE es en-us: sin override los mensajes de Django saldrían en inglés.
+    # Los mensajes son perezosos: se convierten a texto dentro del override.
+    with translation.override('es'):
+        try:
+            validate_password(nueva, user)
+            mensajes = []
+        except ValidationError as e:
+            mensajes = [str(m) for m in e.messages]
+    if mensajes:
+        return Response({'error': ' '.join(mensajes), 'detalle': mensajes}, status=status.HTTP_400_BAD_REQUEST)
+
+    with transaction.atomic():
+        user.set_password(nueva)
+        user.save(update_fields=['password'])
+        usuario = _usuario_de_sesion(request)
+        if usuario:  # el registro guarda también la clave en Usuario: se mantienen iguales
+            usuario.password_hash = make_password(nueva)
+            usuario.save(update_fields=['password_hash'])
+    update_session_auth_hash(request, user)  # sin esto, cambiar la clave cerraría esta sesión
+    return Response({'mensaje': 'Contraseña actualizada.'})
+
+
+@api_view(['POST'])
+@permission_classes([SesionIniciada])
+def eliminar_cuenta_api_view(request):
+    """Anonimiza la cuenta (no borra filas): los pedidos se conservan para la contabilidad."""
+    from django.contrib.auth.hashers import make_password
+    from .models import VehiculoCliente
+
+    user = request.user
+    if user.is_staff:
+        return Response({'error': 'Las cuentas de administrador no se pueden eliminar desde aquí. '
+                                  'Pide a otro administrador que la desactive.'}, status=status.HTTP_403_FORBIDDEN)
+    if not user.check_password(request.data.get('password') or ''):
+        return Response({'error': 'La contraseña no es correcta.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    usuario = _usuario_de_sesion(request)
+    with transaction.atomic():
+        if usuario:
+            VehiculoCliente.objects.filter(usuario=usuario).delete()
+            usuario.nombre_completo = 'Cuenta eliminada'
+            usuario.email = f'eliminado-{usuario.id}@repuestosrs.invalid'
+            usuario.telefono = ''
+            usuario.rut = f'ELIM-{usuario.id}'[:12]  # único y nunca es un RUT válido
+            usuario.password_hash = make_password(None)  # clave inutilizable
+            usuario.save()
+        user.first_name, user.last_name = 'Cuenta eliminada', ''
+        user.email = user.username = f'eliminado-{user.id}@repuestosrs.invalid'
+        user.set_unusable_password()
+        user.is_active = False
+        user.save()
+    django_logout(request)
+    return Response({'mensaje': 'Tu cuenta fue eliminada.'})
+
+
+def _anios_vehiculo(v):
+    return f'{v.anio_inicio}-{v.anio_fin}' if v.anio_fin else f'{v.anio_inicio}+'
+
+
+@api_view(['GET'])
+@permission_classes([SesionIniciada])
+def mis_vehiculos_api_view(request):
+    from .models import VehiculoCliente
+    usuario = _usuario_de_sesion(request)
+    vehiculos = VehiculoCliente.objects.filter(usuario=usuario).select_related('vehiculo_base').order_by('id') if usuario else []
+    return Response([
+        {'id': v.id, 'marca': v.vehiculo_base.marca, 'modelo': v.vehiculo_base.modelo,
+         'anio': _anios_vehiculo(v.vehiculo_base), 'motorizacion': v.vehiculo_base.motorizacion or '',
+         'patente': v.patente or '', 'color': v.color or ''}
+        for v in vehiculos
+    ])
+
+
+@api_view(['DELETE'])
+@permission_classes([SesionIniciada])
+def mi_vehiculo_api_view(request, pk):
+    from .models import VehiculoCliente
+    usuario = _usuario_de_sesion(request)
+    # Filtra por dueño: el vehículo de otro cliente responde 404, igual que uno inexistente
+    borrados, _ = VehiculoCliente.objects.filter(pk=pk, usuario=usuario).delete() if usuario else (0, None)
+    if not borrados:
+        return Response({'error': 'Vehículo no encontrado.'}, status=status.HTTP_404_NOT_FOUND)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _mis_pedidos(request):
+    """Pedidos de la cuenta, más los de invitado hechos con su mismo correo."""
+    usuario = _usuario_de_sesion(request)
+    correo = (request.user.email or request.user.username or '').strip()
+    filtro = Q(usuario__isnull=True, email_cliente__iexact=correo) if correo else Q(pk__in=[])
+    if usuario:
+        filtro |= Q(usuario=usuario)
+    return Pedido.objects.filter(filtro)
+
+
+def seguimiento_url(courier, codigo):
+    """URL de seguimiento según settings.COURIER_TRACKING_URLS, o None si el courier no está."""
+    if not courier or not codigo:
+        return None
+    clave = ''.join(c for c in clave_alfabetica(courier) if c.isalnum())  # "Blue Express" -> "blueexpress"
+    plantilla = settings.COURIER_TRACKING_URLS.get(clave)
+    return plantilla.replace('{codigo}', quote(codigo.strip(), safe='')) if plantilla else None
+
+
+@api_view(['GET'])
+@permission_classes([SesionIniciada])
+def mis_pedidos_api_view(request):
+    pedidos = _mis_pedidos(request).annotate(cantidad_items=Coalesce(Sum('detallepedido__cantidad'), 0))
+    return Response([
+        {'id': p.id, 'fecha_creacion': p.fecha_creacion, 'estado': p.estado, 'estado_texto': p.get_estado_display(),
+         'monto_total': p.monto_total, 'cantidad_items': p.cantidad_items}
+        for p in pedidos.order_by('-fecha_creacion', '-id')
+    ])
+
+
+@api_view(['GET'])
+@permission_classes([SesionIniciada])
+def mi_pedido_api_view(request, pk):
+    # Solo campos para el cliente: sin pagos, tokens ni datos internos
+    p = _mis_pedidos(request).select_related('tarifa').filter(pk=pk).first()
+    if not p:
+        return Response({'error': 'Pedido no encontrado.'}, status=status.HTTP_404_NOT_FOUND)
+    detalles = p.detallepedido_set.select_related('repuesto').order_by('id')
+    return Response({
+        'id': p.id,
+        'fecha_creacion': p.fecha_creacion,
+        'estado': p.estado,
+        'estado_texto': p.get_estado_display(),
+        'productos': [
+            {'nombre': d.repuesto.nombre, 'sku': d.repuesto.sku, 'cantidad': d.cantidad,
+             'precio': d.precio_historico, 'subtotal': d.cantidad * d.precio_historico}
+            for d in detalles
+        ],
+        'subtotal': p.subtotal,
+        'costo_envio': p.costo_envio,
+        'monto_total': p.monto_total,
+        'nombre_destinatario': f'{p.nombre_cliente} {p.apellido_cliente}'.strip(),
+        'direccion_calle': p.direccion_calle,
+        'direccion_complemento': p.direccion_complemento,
+        'instrucciones_entrega': p.instrucciones_entrega,
+        'dias_habiles_estimados': p.tarifa.dias_habiles_estimados if p.tarifa else None,
+        'empresa_courier': p.empresa_courier or '',
+        'codigo_seguimiento': p.codigo_seguimiento or '',
+        'seguimiento_url': seguimiento_url(p.empresa_courier, p.codigo_seguimiento),
     })
 
 
