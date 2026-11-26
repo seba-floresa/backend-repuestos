@@ -145,6 +145,12 @@ def register_api_view(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
+    # Mismo criterio del formulario y de /api/mi-perfil/. Vacío se sigue aceptando, como hasta ahora.
+    if telefono:
+        telefono = _telefono_valido(telefono)
+        if not telefono:
+            return Response({"error": "El teléfono debe tener 9 dígitos después del +56."}, status=status.HTTP_400_BAD_REQUEST)
+
     # Validamos duplicados tanto en tu tabla Usuario como en la de Django
     if Usuario.objects.filter(email=email).exists() or User.objects.filter(email=email).exists():
         return Response(
@@ -701,18 +707,64 @@ def _anios_vehiculo(v):
     return f'{v.anio_inicio}-{v.anio_fin}' if v.anio_fin else f'{v.anio_inicio}+'
 
 
-@api_view(['GET'])
+def _vehiculo_cliente_json(v):
+    return {'id': v.id, 'marca': v.vehiculo_base.marca, 'modelo': v.vehiculo_base.modelo,
+            'anio': _anios_vehiculo(v.vehiculo_base), 'motorizacion': v.vehiculo_base.motorizacion or '',
+            'patente': v.patente or '', 'vin': v.vin or '', 'color': v.color or ''}
+
+
+def _vehiculo_del_catalogo(datos):
+    """Vehiculo base que calza con marca, modelo, año y (si se puede) motor de la búsqueda por patente/VIN."""
+    candidatos = Vehiculo.objects.filter(marca__iexact=datos.get('marca') or '', modelo__iexact=datos.get('modelo') or '')
+    anio = datos.get('anio')
+    if isinstance(anio, int):
+        candidatos = candidatos.filter(Q(anio_fin__isnull=True) | Q(anio_fin__gte=anio), anio_inicio__lte=anio)
+    candidatos = list(candidatos.order_by('id'))
+    motor = clave_alfabetica(datos.get('motorizacion'))
+    return next((v for v in candidatos if clave_alfabetica(v.motorizacion) == motor), None) or next(iter(candidatos), None)
+
+
+@api_view(['GET', 'POST'])
 @permission_classes([SesionIniciada])
 def mis_vehiculos_api_view(request):
     from .models import VehiculoCliente
     usuario = _usuario_de_sesion(request)
-    vehiculos = VehiculoCliente.objects.filter(usuario=usuario).select_related('vehiculo_base').order_by('id') if usuario else []
-    return Response([
-        {'id': v.id, 'marca': v.vehiculo_base.marca, 'modelo': v.vehiculo_base.modelo,
-         'anio': _anios_vehiculo(v.vehiculo_base), 'motorizacion': v.vehiculo_base.motorizacion or '',
-         'patente': v.patente or '', 'color': v.color or ''}
-        for v in vehiculos
-    ])
+
+    if request.method == 'GET':
+        vehiculos = VehiculoCliente.objects.filter(usuario=usuario).select_related('vehiculo_base').order_by('id') if usuario else []
+        return Response([_vehiculo_cliente_json(v) for v in vehiculos])
+
+    # POST: { "vehiculo_id": 3 } (pestaña Datos) o { "patente": "ABCD12" } / { "vin": "..." } (pestañas Patente y VIN)
+    if not usuario:
+        return Response({'error': 'Tu cuenta no tiene perfil de cliente.'}, status=status.HTTP_400_BAD_REQUEST)
+    patente = vin = None
+    identificador = str(request.data.get('patente') or request.data.get('vin') or '').strip()
+    if identificador:
+        # Los datos salen del buscador del servidor, no del navegador
+        encontrado = MockBuscadorVehiculo().buscar(identificador)
+        if not encontrado:
+            return Response({'error': 'Vehículo no encontrado en los registros.'}, status=status.HTTP_404_NOT_FOUND)
+        base = _vehiculo_del_catalogo(encontrado)
+        patente = (encontrado.get('patente') or '').upper()[:10] or None
+        vin = (encontrado.get('vin') or '').upper()[:17] or None
+        if not base:
+            return Response({'error': 'Ese vehículo aún no está en nuestro catálogo.'}, status=status.HTTP_400_BAD_REQUEST)
+    else:
+        vehiculo_id = request.data.get('vehiculo_id')
+        base = Vehiculo.objects.filter(pk=vehiculo_id).first() if str(vehiculo_id).isdigit() else None
+        if not base:
+            return Response({'error': 'Elige un vehículo del catálogo.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    existente = VehiculoCliente.objects.filter(usuario=usuario, vehiculo_base=base, patente=patente, vin=vin).first()
+    if existente:  # duplicado exacto: se devuelve el que ya tiene
+        return Response(_vehiculo_cliente_json(existente), status=status.HTTP_200_OK)
+    try:
+        with transaction.atomic():
+            nuevo = VehiculoCliente.objects.create(usuario=usuario, vehiculo_base=base, patente=patente, vin=vin)
+    except IntegrityError:
+        # patente y vin son únicos en toda la tabla: ya los tiene otra cuenta (u otro vehículo de esta)
+        return Response({'error': 'Esa patente o VIN ya está registrada en una cuenta.'}, status=status.HTTP_409_CONFLICT)
+    return Response(_vehiculo_cliente_json(nuevo), status=status.HTTP_201_CREATED)
 
 
 @api_view(['DELETE'])

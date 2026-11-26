@@ -198,7 +198,6 @@ WEBPAY_API_KEY = os.environ.get('WEBPAY_API_KEY') or (
 # ni símbolos ("Blue Express" -> "blueexpress"). {codigo} se reemplaza por el código de seguimiento.
 # Si el courier no está aquí, el cliente ve solo el código (seguimiento_url = null).
 COURIER_TRACKING_URLS = {
-    # TODO: verificar la URL real de seguimiento en starken.cl antes de producción (esta plantilla no está confirmada).
     'starken': 'https://www.starken.cl/seguimiento?codigo={codigo}',
 }
 

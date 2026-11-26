@@ -797,6 +797,54 @@ class CuentaClienteTest(TestCase):
         r = self.json('post', '/api/login/', {'email': 'ana@x.cl', 'password': self.CLAVE})
         self.assertEqual(r.status_code, 401)
 
+    def test_agregar_vehiculo_desde_datos(self):
+        self.client.force_login(self.user_ana)
+        url = '/api/mis-vehiculos/'
+        r = self.json('post', url, {'vehiculo_id': self.veh.id})
+        self.assertEqual(r.status_code, 201, r.content)
+        self.assertEqual((r.json()['marca'], r.json()['modelo'], r.json()['anio']), ('Toyota', 'Yaris', '2015-2020'))
+        # Duplicado exacto: devuelve el mismo, no crea otro
+        r2 = self.json('post', url, {'vehiculo_id': self.veh.id})
+        self.assertEqual((r2.status_code, r2.json()['id']), (200, r.json()['id']))
+        self.assertEqual(VehiculoCliente.objects.filter(usuario=self.ana, patente__isnull=True).count(), 1)
+        self.assertEqual(self.json('post', url, {'vehiculo_id': 99999}).status_code, 400)
+        # No aparece en la cuenta de otro cliente
+        self.client.force_login(self.user_beto)
+        self.assertEqual([v['patente'] for v in self.client.get(url).json()], ['BBBB22'])
+
+    def test_agregar_vehiculo_por_patente(self):
+        # mock_vehiculos.json: ABCD12 = Toyota Hilux 2022, 2.8 Diesel
+        Vehiculo.objects.create(marca='Toyota', modelo='Hilux', anio_inicio=2005, anio_fin=2015, motorizacion='2.5 Diesel')
+        hilux = Vehiculo.objects.create(marca='Toyota', modelo='Hilux', anio_inicio=2016, motorizacion='2.8 Diesel')
+        self.client.force_login(self.user_ana)
+        r = self.json('post', '/api/mis-vehiculos/', {'patente': 'abcd-12', 'marca': 'Ferrari'})  # la marca del navegador se ignora
+        self.assertEqual(r.status_code, 201, r.content)
+        v = VehiculoCliente.objects.get(id=r.json()['id'])
+        self.assertEqual((v.vehiculo_base, v.patente, v.vin), (hilux, 'ABCD12', 'ABCD1234567890VIN'))
+        self.assertEqual(self.json('post', '/api/mis-vehiculos/', {'patente': 'ABCD12'}).status_code, 200)  # duplicado
+        self.assertEqual(self.json('post', '/api/mis-vehiculos/', {'patente': 'ZZZZ00'}).status_code, 404)
+        # La misma patente en otra cuenta: conflicto, no se crea ni se muestra
+        self.client.force_login(self.user_beto)
+        self.assertEqual(self.json('post', '/api/mis-vehiculos/', {'vin': 'ABCD1234567890VIN'}).status_code, 409)
+        self.assertEqual(VehiculoCliente.objects.filter(patente='ABCD12').count(), 1)
+        self.assertNotIn('ABCD12', [x['patente'] for x in self.client.get('/api/mis-vehiculos/').json()])
+
+    def test_agregar_vehiculo_anonimo_403(self):
+        r = self.json('post', '/api/mis-vehiculos/', {'vehiculo_id': self.veh.id})
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(VehiculoCliente.objects.count(), 2)
+
+    def test_registro_valida_telefono(self):
+        datos = {'rut': '33333333-3', 'nombre_completo': 'Carla Díaz', 'email': 'carla@x.cl', 'password': self.CLAVE}
+        for malo in ('12345678', '+5691234567', 'abc'):
+            r = self.json('post', '/api/register/', {**datos, 'telefono': malo})
+            self.assertEqual(r.status_code, 400, malo)
+            self.assertIn('teléfono', r.json()['error'])
+        self.assertFalse(Usuario.objects.filter(email='carla@x.cl').exists())
+        # Lo que envía el formulario hoy: +56 y 9 dígitos
+        self.assertEqual(self.json('post', '/api/register/', {**datos, 'telefono': '+56912345678'}).status_code, 201)
+        self.assertEqual(Usuario.objects.get(email='carla@x.cl').telefono, '+56912345678')
+
     def test_admin_no_se_elimina(self):
         admin = User.objects.create_user('jefe@x.cl', 'jefe@x.cl', self.CLAVE, is_staff=True)
         self.client.force_login(admin)
